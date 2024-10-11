@@ -197,7 +197,7 @@ func (r *InitSqlserverInstanceComp) ExportInstanceConf() error {
 func (r *InitSqlserverInstanceComp) InitSysDB() error {
 	var files []string
 	var err error
-	if files, err = WriteInitSQLFile(); err != nil {
+	if files, err = WriteInitSQLFileV2(); err != nil {
 		return err
 	}
 	if err := sqlserver.ExecLocalSQLFile(r.SqlserverVerion, "master", 0, files, r.Params.Port); err != nil {

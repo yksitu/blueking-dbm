@@ -141,7 +141,7 @@ func (s *SysInitParam) CreateSysUser() error {
 	// 创建backupman账号
 	backupman := osutil.WINSOSUser{
 		User:    "backupman",
-		Pass:    osutil.GenerateRandomString(12),
+		Pass:    fmt.Sprintf("%sAa!#", osutil.GenerateRandomString(8)),
 		Comment: "BACKUP ACCOUNT",
 	}
 	if backupman.UserExists() {
