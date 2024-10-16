@@ -193,11 +193,7 @@ func (r *InitSqlserverInstanceComp) ExportInstanceConf() error {
 		return err
 	}
 	// 保留backup_trace表数据都master库
-	saveSQL := []string{
-		"drop table if exists [master].[dbo].[BACKUP_TRACE];",
-		fmt.Sprintf("SELECT * INTO [master].[dbo].[BACKUP_TRACE] FROM [%s].[dbo].[BACKUP_TRACE];", cst.SysDB),
-	}
-	if _, err := r.DB.ExecMore(saveSQL); err != nil {
+	if _, err := r.DB.Exec(fmt.Sprintf(cst.SAVE_BACKUP_TRACE_SQL, cst.SysDB)); err != nil {
 		logger.Error("save BACKUP_TRACE in master failed: %v", err)
 		return err
 	}
