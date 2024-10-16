@@ -180,14 +180,26 @@ func (r *InitSqlserverInstanceComp) ExportInstanceConf() error {
 	// 查询backup_filter
 	if err := r.DB.Queryx(&r.BackupFilter, fmt.Sprintf(cst.BACKUP_FILTER_SQL, cst.SysDB)); err != nil {
 		logger.Error("check backup_filter_table failed: %v", err)
+		return err
 	}
 	// 查询mirroring_filter
 	if err := r.DB.Queryx(&r.MirroringFilter, fmt.Sprintf(cst.MIORRING_FILTER_SQL, cst.SysDB)); err != nil {
 		logger.Error("check mirroring_filter_table failed: %v", err)
+		return err
 	}
 	// 查询backup_settings
 	if err := r.DB.Queryx(&r.BackupConfigs, fmt.Sprintf(cst.BACKUP_SETTING_SQL, cst.SysDB)); err != nil {
 		logger.Error("check backup_settings_table failed: %v", err)
+		return err
+	}
+	// 保留backup_trace表数据都master库
+	saveSQL := []string{
+		"drop table if exists [master].[dbo].[BACKUP_TRACE];",
+		fmt.Sprintf("SELECT * INTO [master].[dbo].[BACKUP_TRACE] FROM [%s].[dbo].[BACKUP_TRACE];", cst.SysDB),
+	}
+	if _, err := r.DB.ExecMore(saveSQL); err != nil {
+		logger.Error("save BACKUP_TRACE in master failed: %v", err)
+		return err
 	}
 	return nil
 
@@ -307,9 +319,9 @@ func (r *InitSqlserverInstanceComp) CreateSysDir() error {
 	}
 	if check {
 		// 添加E盘必须创建的目录
-		createDir = append(createDir, filepath.Join(cst.BASE_DATA_PATH, cst.BASE_BACKUP_PATH))
-		createDir = append(createDir, filepath.Join(cst.BASE_DATA_PATH, cst.BASE_BACKUP_PATH, "full"))
-		createDir = append(createDir, filepath.Join(cst.BASE_DATA_PATH, cst.BASE_BACKUP_PATH, "log"))
+		createDir = append(createDir, filepath.Join(cst.BASE_BACKUP_PATH, cst.MSSQL_BACKUP_NAME))
+		createDir = append(createDir, filepath.Join(cst.BASE_BACKUP_PATH, cst.MSSQL_BACKUP_NAME, "full"))
+		createDir = append(createDir, filepath.Join(cst.BASE_BACKUP_PATH, cst.MSSQL_BACKUP_NAME, "log"))
 	}
 
 	// 循环创建目录

@@ -3109,10 +3109,10 @@ BEGIN
 	DECLARE @DBNAME VARCHAR(1000),@PATH VARCHAR(1000),@FILENAME VARCHAR(1000),@STARTTIME VARCHAR(100),@ENDTIME VARCHAR(100),@FILESIZE VARCHAR(100)
 	DECLARE @BACKUP_STR VARCHAR(MAX),@TASK_ID VARCHAR(100)
 	DECLARE @FILECNT BIGINT,@DBSIZE BIGINT,@DBLEVEL BIGINT
-	DECLARE @FirstLSN bigint
-	DECLARE @LastLSN bigint
-	DECLARE @CheckpointLSN bigint
-	DECLARE @DataBaseBackupLSN bigint
+	DECLARE @FirstLSN numeric(25,0)
+	DECLARE @LastLSN numeric(25,0)
+	DECLARE @CheckpointLSN numeric(25,0)
+	DECLARE @DataBaseBackupLSN numeric(25,0)
 	DECLARE @BackupStartDate datetime
 	DECLARE @BackupFinishDate datetime
 
@@ -3453,12 +3453,12 @@ BEGIN
 DECLARE @SQL VARCHAR(8000)
 
 SELECT @SQL = ISNULL(@SQL+'','')+'EXEC ['+name+'].dbo.sp_changedbowner @loginame = N''sa'', @map = false;'
-from master.sys.databases where database_id>4 and name not in('Monitor') and state=0 and is_read_only=0 and is_distributor = 0  and owner_sid<>0x01
+from master.sys.databases where database_id>4 and name not in('Monitor') and state=0 and is_read_only=0 and is_distributor = 0  and owner_sid in(select sid from master.sys.sql_logins where sid<>0x01 and name like '%J_%')
 --PRINT(@SQL)
 EXEC(@SQL)
 
 SELECT @SQL = ISNULL(@SQL+'','')+'EXEC msdb.dbo.sp_update_job @job_name=N'''+name+''', @owner_login_name=N''sa'';'
-from msdb.dbo.sysjobs where owner_sid<>0x01
+from msdb.dbo.sysjobs where owner_sid in(select sid from master.sys.sql_logins where sid<>0x01 and name like '%J_%')
 --PRINT(@SQL)
 EXEC(@SQL)
 

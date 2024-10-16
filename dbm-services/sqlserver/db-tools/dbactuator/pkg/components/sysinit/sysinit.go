@@ -177,9 +177,9 @@ func (s *SysInitParam) CreateSysDir() error {
 	}
 	if check {
 		// 添加E盘必须创建的目录
-		createDir = append(createDir, filepath.Join(cst.BASE_DATA_PATH, cst.BASE_BACKUP_PATH))
-		createDir = append(createDir, filepath.Join(cst.BASE_DATA_PATH, cst.BASE_BACKUP_PATH, "full"))
-		createDir = append(createDir, filepath.Join(cst.BASE_DATA_PATH, cst.BASE_BACKUP_PATH, "log"))
+		createDir = append(createDir, filepath.Join(cst.BASE_BACKUP_PATH, cst.MSSQL_BACKUP_NAME))
+		createDir = append(createDir, filepath.Join(cst.BASE_BACKUP_PATH, cst.MSSQL_BACKUP_NAME, "full"))
+		createDir = append(createDir, filepath.Join(cst.BASE_BACKUP_PATH, cst.MSSQL_BACKUP_NAME, "log"))
 	}
 
 	// 循环创建目录
