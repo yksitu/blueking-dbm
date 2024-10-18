@@ -1357,9 +1357,9 @@ WHERE A.SESSION_ID = B.SESSION_ID
 INSERT INTO #tmp_mssql_exporter
 SELECT 'mssql_database_mdfsize',CAST(ISNULL((case when SUM(CAST(SIZE AS BIGINT)*8.0)=0 then 0 when SUM(CAST(SIZE AS BIGINT)*8.0)<1048576 then 1048576 else SUM(CAST(SIZE AS BIGINT)*8.0) end)/1024/1024,0) AS NUMERIC(18,1)),'database_mdfsize',2
 FROM SYS.DATABASES A(NOLOCK),SYS.MASTER_FILES B(NOLOCK) 
-WHERE A.DATABASE_ID = B.DATABASE_ID AND B.type=0
+WHERE A.DATABASE_ID = B.DATABASE_ID
 UNION ALL
-SELECT 'mssql_database_ldfsize',CAST(ISNULL((case when SUM(CAST(SIZE AS BIGINT)*8.0)=0 then 0 when SUM(CAST(SIZE AS BIGINT)*8.0)<1048576 then 1048576 else SUM(CAST(SIZE AS BIGINT)*8.0) end)/1024/1024,0) AS NUMERIC(18,1)),'database_ldfsize',2
+SELECT 'mssql_database_ldfsize',CAST(ISNULL((case when MAX(CAST(SIZE AS BIGINT)*8.0)=0 then 0 when SUM(CAST(SIZE AS BIGINT)*8.0)<1048576 then 1048576 else MAX(CAST(SIZE AS BIGINT)*8.0) end)/1024/1024,0) AS NUMERIC(18,1)),'database_ldfsize',2
 FROM SYS.DATABASES A(NOLOCK),SYS.MASTER_FILES B(NOLOCK)
 WHERE A.DATABASE_ID = B.DATABASE_ID AND B.type=1
 
@@ -3552,12 +3552,12 @@ BEGIN
 DECLARE @SQL VARCHAR(8000)
 
 SELECT @SQL = ISNULL(@SQL+'','')+'EXEC ['+name+'].dbo.sp_changedbowner @loginame = N''sa'', @map = false;'
-from master.sys.databases where database_id>4 and name not in('Monitor') and state=0 and is_read_only=0 and is_distributor = 0  and owner_sid in(select sid from master.sys.sql_logins where sid<>0x01 and name like '%J_%')
+from master.sys.databases where database_id>4 and name not in('Monitor') and state=0 and is_read_only=0 and is_distributor = 0  and owner_sid in(select sid from master.sys.sql_logins where sid<>0x01 name LIKE '%\_%' ESCAPE '\')
 --PRINT(@SQL)
 EXEC(@SQL)
 
 SELECT @SQL = ISNULL(@SQL+'','')+'EXEC msdb.dbo.sp_update_job @job_name=N'''+name+''', @owner_login_name=N''sa'';'
-from msdb.dbo.sysjobs where owner_sid in(select sid from master.sys.sql_logins where sid<>0x01 and name like '%J_%')
+from msdb.dbo.sysjobs where owner_sid in(select sid from master.sys.sql_logins where sid<>0x01 name LIKE '%\_%' ESCAPE '\')
 --PRINT(@SQL)
 EXEC(@SQL)
 

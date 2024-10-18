@@ -1,3 +1,13 @@
+/*
+ * TencentBlueKing is pleased to support the open source community by making 蓝鲸智云-DB管理系统(BlueKing-BK-DBM) available.
+ * Copyright (C) 2017-2023 THL A29 Limited, a Tencent company. All rights reserved.
+ * Licensed under the MIT License (the "License"); you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at https://opensource.org/licenses/MIT
+ * Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+ * an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+ * specific language governing permissions and limitations under the License.
+ */
+
 
 USE MASTER
 SET QUOTED_IDENTIFIER ON
@@ -1258,9 +1268,9 @@ WHERE A.SESSION_ID = B.SESSION_ID
 INSERT INTO #tmp_mssql_exporter
 SELECT 'mssql_database_mdfsize',CAST(ISNULL((case when SUM(CAST(SIZE AS BIGINT)*8.0)=0 then 0 when SUM(CAST(SIZE AS BIGINT)*8.0)<1048576 then 1048576 else SUM(CAST(SIZE AS BIGINT)*8.0) end)/1024/1024,0) AS NUMERIC(18,1)),'database_mdfsize',2
 FROM SYS.DATABASES A(NOLOCK),SYS.MASTER_FILES B(NOLOCK) 
-WHERE A.DATABASE_ID = B.DATABASE_ID AND B.type=0
+WHERE A.DATABASE_ID = B.DATABASE_ID
 UNION ALL
-SELECT 'mssql_database_ldfsize',CAST(ISNULL((case when SUM(CAST(SIZE AS BIGINT)*8.0)=0 then 0 when SUM(CAST(SIZE AS BIGINT)*8.0)<1048576 then 1048576 else SUM(CAST(SIZE AS BIGINT)*8.0) end)/1024/1024,0) AS NUMERIC(18,1)),'database_ldfsize',2
+SELECT 'mssql_database_ldfsize',CAST(ISNULL((case when MAX(CAST(SIZE AS BIGINT)*8.0)=0 then 0 when SUM(CAST(SIZE AS BIGINT)*8.0)<1048576 then 1048576 else MAX(CAST(SIZE AS BIGINT)*8.0) end)/1024/1024,0) AS NUMERIC(18,1)),'database_ldfsize',2
 FROM SYS.DATABASES A(NOLOCK),SYS.MASTER_FILES B(NOLOCK)
 WHERE A.DATABASE_ID = B.DATABASE_ID AND B.type=1
 
