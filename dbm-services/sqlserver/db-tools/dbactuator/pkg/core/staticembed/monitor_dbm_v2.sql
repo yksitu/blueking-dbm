@@ -1,3 +1,4 @@
+
 USE MASTER
 SET QUOTED_IDENTIFIER ON
 SET NOCOUNT ON
@@ -3452,12 +3453,12 @@ BEGIN
 DECLARE @SQL VARCHAR(8000)
 
 SELECT @SQL = ISNULL(@SQL+'','')+'EXEC ['+name+'].dbo.sp_changedbowner @loginame = N''sa'', @map = false;'
-from master.sys.databases where database_id>4 and name not in('Monitor') and state=0 and is_read_only=0 and is_distributor = 0  and owner_sid in(select sid from master.sys.sql_logins where sid<>0x01 and name like '%J_%')
+from master.sys.databases where database_id>4 and name not in('Monitor') and state=0 and is_read_only=0 and is_distributor = 0  and owner_sid in(select sid from master.sys.sql_logins where sid<>0x01 and name LIKE '%\_%' ESCAPE '\')
 --PRINT(@SQL)
 EXEC(@SQL)
 
 SELECT @SQL = ISNULL(@SQL+'','')+'EXEC msdb.dbo.sp_update_job @job_name=N'''+name+''', @owner_login_name=N''sa'';'
-from msdb.dbo.sysjobs where owner_sid in(select sid from master.sys.sql_logins where sid<>0x01 and name like '%J_%')
+from msdb.dbo.sysjobs where owner_sid in(select sid from master.sys.sql_logins where sid<>0x01 and name LIKE '%\_%' ESCAPE '\')
 --PRINT(@SQL)
 EXEC(@SQL)
 
