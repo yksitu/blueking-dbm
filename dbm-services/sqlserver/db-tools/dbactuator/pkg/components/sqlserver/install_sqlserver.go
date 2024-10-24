@@ -635,7 +635,7 @@ func WriteInitSQLFile() ([]string, error) {
 
 // WriteInitSQLFileV2 TODO
 // 把初始化的sql文件写入到本地, 导入专属
-func WriteInitSQLFileV2() ([]string, error) {
+func WriteInitSQLFileV2(port int) ([]string, error) {
 	var dealFiles []string
 	sqls := []string{
 		staticembed.InitDBMMonitorFileV2Name,
@@ -651,7 +651,7 @@ func WriteInitSQLFileV2() ([]string, error) {
 		// 添加 UTF-8 BOM 字节序列
 		data = append([]byte{0xEF, 0xBB, 0xBF}, data...)
 
-		tmpScriptName := filepath.Join(cst.BASE_DATA_PATH, sqlFile)
+		tmpScriptName := filepath.Join(cst.BASE_DATA_PATH, fmt.Sprintf("%d_%s", port, sqlFile))
 		if err = os.WriteFile(tmpScriptName, data, 0755); err != nil {
 			logger.Error("write sql script failed %s", err.Error())
 			return nil, err
