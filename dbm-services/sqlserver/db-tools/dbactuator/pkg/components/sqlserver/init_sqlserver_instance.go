@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"dbm-services/common/go-pubpkg/logger"
 	"dbm-services/sqlserver/db-tools/dbactuator/pkg/components"
@@ -212,21 +211,19 @@ func (r *InitSqlserverInstanceComp) InitSysDB() error {
 		return err
 	}
 	// 继承相关配置
-	if len(r.BackupFilter) > 0 {
+	for _, name := range r.BackupFilter {
 		insertBackupFilterSQL := fmt.Sprintf(
 			"insert into [%s].[dbo].[BACKUP_FILTER] values ('%s')",
-			cst.SysDB,
-			strings.Join(r.BackupFilter, "','"),
+			cst.SysDB, name,
 		)
 		if _, err := r.DB.Exec(insertBackupFilterSQL); err != nil {
 			return err
 		}
 	}
-	if len(r.MirroringFilter) > 0 {
+	for _, name := range r.MirroringFilter {
 		insertMirroringFilterSQL := fmt.Sprintf(
 			"insert into [%s].[dbo].[MIRRORING_FILTER] values ('%s')",
-			cst.SysDB,
-			strings.Join(r.MirroringFilter, "','"),
+			cst.SysDB, name,
 		)
 		if _, err := r.DB.Exec(insertMirroringFilterSQL); err != nil {
 			return err
