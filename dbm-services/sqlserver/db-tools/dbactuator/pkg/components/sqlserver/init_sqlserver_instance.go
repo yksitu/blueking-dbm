@@ -12,13 +12,11 @@ package sqlserver
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"dbm-services/common/go-pubpkg/logger"
 	"dbm-services/sqlserver/db-tools/dbactuator/pkg/components"
 	"dbm-services/sqlserver/db-tools/dbactuator/pkg/core/cst"
-	"dbm-services/sqlserver/db-tools/dbactuator/pkg/core/staticembed"
 	"dbm-services/sqlserver/db-tools/dbactuator/pkg/util/osutil"
 	"dbm-services/sqlserver/db-tools/dbactuator/pkg/util/sqlserver"
 )
@@ -237,23 +235,8 @@ func (r *InitSqlserverInstanceComp) InitSysDB() error {
 func (r *InitSqlserverInstanceComp) PrintBackupConfig() error {
 
 	// 重建临时表
-	sqlFile := staticembed.CreateBackupOldTable
-	data, err := staticembed.SQLScript.ReadFile(sqlFile)
-	if err != nil {
-		return fmt.Errorf("read sql script failed %s", err.Error())
-	}
-	// 添加 UTF-8 BOM 字节序列
-	data = append([]byte{0xEF, 0xBB, 0xBF}, data...)
-
-	tmpScriptName := filepath.Join(cst.BASE_DATA_PATH, sqlFile)
-	if err = os.WriteFile(tmpScriptName, data, 0755); err != nil {
-		logger.Error("write sql script failed %s", err.Error())
-		return err
-	}
-	// 执行
-	if err := sqlserver.ExecLocalSQLFile(
-		r.SqlserverVerion, cst.SysDB, 0, []string{tmpScriptName}, r.Params.Port,
-	); err != nil {
+	if _, err := r.DB.Exec(fmt.Sprintf(cst.CREATE_BACKUP_SQL, cst.SysDB)); err != nil {
+		logger.Error("CREATE BACKUP_TRACE in master failed: %v", err)
 		return err
 	}
 
@@ -280,12 +263,6 @@ func (r *InitSqlserverInstanceComp) PrintBackupConfig() error {
 		if _, err := r.DB.Exec(insertSql); err != nil {
 			return err
 		}
-	}
-
-	// 执行完成后删除文件,删除失败不退出
-	remoteCmd := fmt.Sprintf("REMOVE-ITEM %s", sqlFile)
-	if _, err := osutil.StandardPowerShellCommand(remoteCmd); err != nil {
-		logger.Warn("delete [%s] failed %s", sqlFile, err.Error())
 	}
 
 	return nil
