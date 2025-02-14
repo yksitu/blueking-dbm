@@ -98,5 +98,14 @@ class _DRSApi(object):
             description=_("webconsole 远程执行(只读账号)"),
         )
 
+        self.webconsole_rpc = ProxyAPI(
+            method="POST",
+            base=self.BASE_DOMAIN,
+            url="mysql/complex-rpc",
+            module=self.MODULE,
+            ssl=ssl_flag,
+            description=_("mysql的复核接口，合并传入，减少SaaS和drs的交互"),
+        )
+
 
 DRSApi = _DRSApi()
