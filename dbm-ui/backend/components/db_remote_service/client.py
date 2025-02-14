@@ -98,7 +98,7 @@ class _DRSApi(object):
             description=_("webconsole 远程执行(只读账号)"),
         )
 
-        self.webconsole_rpc = ProxyAPI(
+        self.mysql_complex_rpc = ProxyAPI(
             method="POST",
             base=self.BASE_DOMAIN,
             url="mysql/complex-rpc",
