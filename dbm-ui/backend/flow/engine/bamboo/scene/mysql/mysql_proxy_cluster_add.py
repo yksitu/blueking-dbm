@@ -63,11 +63,11 @@ class MySQLProxyClusterAddFlow(object):
         "infos": [
             {
                 "cluster_ids": [1,2],
-                "proxy_ip": {"ip": "x", "bk_cloud_id": 0, "bk_host_id": 1, "bk_biz_id": 1, "spec":{}},
+                "new_proxys": [{"ip": "x", "bk_cloud_id": 0, "bk_host_id": 1, "bk_biz_id": 1, "spec":{}}],
             },
             {
                 "cluster_ids": [3,4],
-                "proxy_ip": {"ip": "x", "bk_cloud_id": 0, "bk_host_id": 1, "bk_biz_id": 1, "spec":{}},
+                "new_proxys": [{"ip": "x", "bk_cloud_id": 0, "bk_host_id": 1, "bk_biz_id": 1, "spec":{}}],
             }
         ]
     }
@@ -143,6 +143,7 @@ class MySQLProxyClusterAddFlow(object):
             sub_flow_context = copy.deepcopy(self.data)
             sub_flow_context.pop("infos")
 
+            # 计算需要安装的proxy
             sub_flow_context["proxy_ports"] = self.__get_proxy_install_ports(cluster_ids=info["cluster_ids"])
             sub_pipeline = SubBuilder(root_id=self.root_id, data=copy.deepcopy(sub_flow_context))
 
@@ -158,11 +159,11 @@ class MySQLProxyClusterAddFlow(object):
                 sub_flow=init_machine_sub_flow(
                     uid=sub_flow_context["uid"],
                     root_id=self.root_id,
-                    bk_cloud_id=int(info["proxy_ip"]["bk_cloud_id"]),
-                    sys_init_ips=[info["proxy_ip"]["ip"]],
-                    init_check_ips=[info["proxy_ip"]["ip"]],
-                    yum_install_perl_ips=[info["proxy_ip"]["ip"]],
-                    bk_host_ids=[info["proxy_ip"]["bk_host_id"]],
+                    bk_cloud_id=int(info["new_proxys"][0]["bk_cloud_id"]),
+                    sys_init_ips=[i["ip"] for i in info["new_proxys"]],
+                    init_check_ips=[i["ip"] for i in info["new_proxys"]],
+                    yum_install_perl_ips=[i["ip"] for i in info["new_proxys"]],
+                    bk_host_ids=[i["bk_host_id"] for i in info["new_proxys"]],
                 )
             )
 
