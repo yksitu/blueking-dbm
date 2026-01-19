@@ -16,6 +16,7 @@ from blue_krill.data_types.enum import EnumField, StrStructuredEnum
 class DBMAgentCode(StrStructuredEnum):
     DBM = EnumField("ai-am", _("DBM 主智能体"))
     LOG_ANALYSIS = EnumField("ai-loganalysis", _("日志分析智能体"))
+    TASK_GUARDIAN = EnumField("ai-task-guardian", _("单据值守智能体"))
     # TODO: 测试后删除
     MAIN = EnumField("ai-kiotest-main", _("主智能体"))
     MYSQL = EnumField("ai-kiotest-mysql", _("MySQL 智能体"))

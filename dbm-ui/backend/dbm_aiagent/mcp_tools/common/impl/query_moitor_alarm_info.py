@@ -52,7 +52,7 @@ class QueryMonitorAlarm(object):
             "start_time": int(start_time.timestamp()),
             "end_time": int(end_time.timestamp()),
             "page": 1,
-            "page_size": 2,
+            "page_size": 10,
             "status": ["ABNORMAL"],
             "show_aggs": False,
             "show_overview": False,
@@ -90,6 +90,7 @@ class QueryMonitorAlarm(object):
                 "alarm_id": alart["id"],
                 "alert_name": alart["alert_name"],
                 "alert_status": alart["status"],
+                "alert_severity": alart["severity"],
                 "alert_create_time": int(alart["create_time"]),
                 "tags": alart["tags"],
             }

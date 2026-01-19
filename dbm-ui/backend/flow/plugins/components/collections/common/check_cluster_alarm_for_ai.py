@@ -8,6 +8,8 @@ an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express o
 specific language governing permissions and limitations under the License.
 """
 import datetime
+import json
+import re
 
 from django.utils import timezone
 from django.utils.translation import gettext as _
@@ -16,10 +18,13 @@ from pipeline.core.flow import StaticIntervalGenerator
 
 from backend.core import notify
 from backend.db_meta.models import Cluster
-from backend.dbm_aiagent.mcp_tools.common.impl.query_moitor_alarm_info import QueryMonitorAlarm
+from backend.dbm_aiagent.agent.commands import QueryAlarmInfoCommand
+from backend.dbm_aiagent.agent.handlers import AgentHandler
 from backend.flow.models import FlowTree
 from backend.flow.plugins.components.collections.common.sidecar_service_abc import SidecarServiceABC
 from backend.utils.time import datetime2str
+
+cpl = re.compile(r"\[ai_result](?P<context>.+?)\[ai_result]")
 
 
 class CheckClusterAlarmForAIService(SidecarServiceABC):
@@ -50,18 +55,27 @@ class CheckClusterAlarmForAIService(SidecarServiceABC):
         self.log_info(_("监听集群有：{}".format(cluster_domains)))
         self.log_info(_("监听的时间区间是：{}-{}".format(datetime2str(flow_start_time), datetime2str(now_time))))
 
-        # todo 后续需要非交互式AI问答框架
-        # 这里先直接调用mcp工具测试一下
-        result = QueryMonitorAlarm.query_alarm_for_cluster_ids(
-            bk_biz_id=clusters[0].bk_biz_id,
-            cluster_domains=cluster_domains,
-            start_time=flow_start_time,
-            end_time=now_time,
+        ai_result = AgentHandler.ask_agent_with_command(
+            command=QueryAlarmInfoCommand.command,
+            command_params={
+                "bk_biz_id": clusters[0].bk_biz_id,
+                "cluster_domains": cluster_domains,
+                "start_time": flow_start_time,
+                "end_time": now_time,
+            },
         )
-        # todo 目前集群无论是健康还是异常， 通过智能体分析的，都会返回结果。但是如何通过返回结果，判断是否推送给用户，这是目前的难题
-        if result:
+        self.log_info(_("智能体输出的结果：{}".format(ai_result)))
+        # 根据ai的分析结果，捕捉是否推送的用户的关键信息
+        is_send_info = json.loads(re.search(cpl, ai_result).group("context"))
+        if is_send_info and is_send_info.get("is_send_user"):
+            # 从智能体根据结果分析来看， 结果为高风险，需要推送给提单者
             # 通过机器人给相关人员推送信息
-            notify.send_msg_for_ai_task_guardian(ticket_id=ticket_id, ai_result=result)
+            # 过滤无效信息
+            self.log_info(_("正在把AI分析结果推送给提单者..."))
+            send_result = ai_result.replace('[ai_result]{"is_send_user": true}[ai_result]', "")
+            notify.send_msg_for_ai_task_guardian(ticket_id=ticket_id, ai_result=send_result)
+            self.log_info(_("推送完成"))
+
         return True
 
 

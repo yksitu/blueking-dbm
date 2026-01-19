@@ -199,7 +199,10 @@ class ImportSQLFlow(object):
             )
 
         p.add_parallel_sub_pipeline(sub_flow_list=sub_pipelines)
-        p.run_pipeline(is_drop_random_user=True)
+        # p.run_pipeline(is_drop_random_user=True)
+        p.run_pipeline_with_sidecar(
+            is_drop_random_user=True, check_ai_monitor_cluster_list=list(set(self.data["cluster_ids"]))
+        )
 
     def sql_semantic_check_flow(self):
         """

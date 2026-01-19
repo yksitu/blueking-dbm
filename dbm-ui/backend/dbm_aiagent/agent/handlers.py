@@ -57,21 +57,26 @@ class AgentHandler:
     @classmethod
     def ask_agent_with_content(cls, agent_code: DBMAgentCode, content: str, username=DEFAULT_USERNAME):
         """根据agent直接内容询问agent"""
-        # 创建临时会话
-        session_code = cls.create_temporary_session(username)
+        try:
+            # 创建临时会话
+            session_code = cls.create_temporary_session(username)
 
-        # 创建会话内容
-        # 主智能体直接询问，子智能体走快捷指令切换询问
-        content_params = {"session_code": session_code, "role": "user", "content": content}
-        if agent_code != DBMAgentCode.DBM:
-            content_property = {"extra": {"command": agent_code, "rendered_content": content}}
-            content_params.update(property=content_property, content=str(DBMAgentCode.get_choice_label(agent_code)))
-        resp = client.api.create_chat_session_content(json=content_params, headers={"X-BKAIDEV-USER": username})
+            # 创建会话内容
+            # 主智能体直接询问，子智能体走快捷指令切换询问
+            content_params = {"session_code": session_code, "role": "user", "content": content}
+            if agent_code != DBMAgentCode.DBM:
+                content_property = {"extra": {"command": agent_code, "rendered_content": content}}
+                content_params.update(
+                    property=content_property, content=str(DBMAgentCode.get_choice_label(agent_code))
+                )
+            resp = client.api.create_chat_session_content(json=content_params, headers={"X-BKAIDEV-USER": username})
 
-        # 获取AI回复
-        session_content_id = resp["data"]["id"]
-        ai_response = cls.create_chat_completion(session_code, session_content_id)
-        return ai_response["choices"][0]["delta"]["content"]
+            # 获取AI回复
+            session_content_id = resp["data"]["id"]
+            ai_response = cls.create_chat_completion(session_code, session_content_id)
+            return ai_response["choices"][0]["delta"]["content"]
+        except Exception as err:
+            print(err)
 
     @classmethod
     def ask_agent_with_command(cls, command: str, command_params: dict, username=DEFAULT_USERNAME):

@@ -39,3 +39,19 @@ class TicketFlowLogAnalysisCommand(CommandHandler):
         错误日志结构化信息：
         {{ log_content }}
         """
+
+
+@command
+class QueryAlarmInfoCommand(CommandHandler):
+    name = _("查询某个时间段集群所产生的，且未恢复状态的告警记录， 不需要人为确认")
+    command = "ai-task-guardian"
+    agent_code = DBMAgentCode.TASK_GUARDIAN
+
+    def get_template(self) -> str:
+        return """
+        查询这段期间集群告警记录，不需要人为确认:
+        {{ bk_biz_id }}
+        {{ cluster_domains }}
+        {{ start_time }}
+        {{ end_time }}
+        """
