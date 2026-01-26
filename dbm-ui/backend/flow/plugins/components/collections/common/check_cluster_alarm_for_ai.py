@@ -60,8 +60,8 @@ class CheckClusterAlarmForAIService(SidecarServiceABC):
             command_params={
                 "bk_biz_id": clusters[0].bk_biz_id,
                 "cluster_domains": cluster_domains,
-                "start_time": flow_start_time,
-                "end_time": now_time,
+                "start_time": datetime2str(flow_start_time),
+                "end_time": datetime2str(now_time),
             },
         )
         self.log_info(_("智能体输出的结果：{}".format(ai_result)))
