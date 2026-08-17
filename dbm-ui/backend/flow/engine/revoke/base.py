@@ -7,13 +7,42 @@ Unless required by applicable law or agreed to in writing, software distributed 
 an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
 """
+from typing import Callable, Type
+
 from backend.flow.engine.revoke.exception import RevokeFlowBaseException
 
+# 挂载到被装饰函数上的属性名；与 RevokeFlowBase.revoke_flow 同名，
+# 供 ticket 层通过 hasattr(func, "revoke_flow") 反射判定是否具备回退能力
+_REVOKE_FLOW_ATTR: str = "revoke_flow"
 
-def revoke_with(flow_func):
-    """装饰器：用于关联流程与回退流程函数"""
 
-    def decorator(main_func):
+def revoke_with(flow_func: Type["RevokeFlowBase"]) -> Callable:
+    """装饰器：用于关联主流程与其对应的回退流程类。
+
+    功能说明 / 怎么做：
+        - 在被装饰函数对象上挂载 ``revoke_flow`` 属性，值为传入的回退流程类的 ``revoke_flow`` 方法；
+        - 单据在 TERMINATED 时，ticket 层通过 ``hasattr(func, "revoke_flow")`` 反射判定是否
+          需要发起 RECYCLE_APPLY_HOST 子单据；recycle 层再通过该属性拿到实际执行回退的入口。
+
+    :param flow_func: 回退流程类，必须是 ``RevokeFlowBase`` 的子类（不是实例，不是普通函数）
+    :return: 真正的装饰器函数，返回原函数本身（不 wrap，仅打标记）
+
+    边界 / 异常：
+        - ``flow_func`` 非 ``RevokeFlowBase`` 子类 -> 抛 ``RevokeFlowBaseException``，
+          让误用在 import 期即暴露，而不是拖到单据终止时才失败；
+        - 被装饰函数已存在 ``revoke_flow`` 属性（重复装饰 / 命名冲突）-> 抛
+          ``RevokeFlowBaseException``，避免静默覆盖。
+    """
+    # 延迟到运行时判定，避免与 RevokeFlowBase 的循环引用
+    if not (isinstance(flow_func, type) and issubclass(flow_func, RevokeFlowBase)):
+        raise RevokeFlowBaseException(f"revoke_with 需传入 RevokeFlowBase 子类，实际得到: {flow_func!r}")
+
+    def decorator(main_func: Callable) -> Callable:
+        # 防止重复装饰或与已有属性静默冲突
+        if hasattr(main_func, _REVOKE_FLOW_ATTR):
+            raise RevokeFlowBaseException(
+                f"{getattr(main_func, '__qualname__', main_func)} 已存在 " f"{_REVOKE_FLOW_ATTR} 属性，禁止重复装饰或覆盖"
+            )
         # 添加校验函数信息到主函数的元数据中
         main_func.revoke_flow = flow_func.revoke_flow
         return main_func
