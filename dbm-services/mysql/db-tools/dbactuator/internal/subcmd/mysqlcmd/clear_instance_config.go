@@ -68,6 +68,10 @@ func (g *ClearInstanceConfigAct) Run() (err error) {
 			FunName: "清理目标实例的周边配置",
 			Func:    g.Service.DoClear,
 		},
+		{
+			FunName: "重新加载DBHA探针配置",
+			Func:    g.Service.DoRestartDBHAProbe,
+		},
 	}
 
 	if err := steps.Run(); err != nil {

@@ -31,6 +31,12 @@ type ClearInstanceConfigComp struct {
 type ClearInstanceConfigParam struct {
 	ClearPorts  []int  `json:"clear_ports" validate:"required,gt=0,dive"`
 	MachineType string `json:"machine_type"`
+	// RestartDBHAProbe 是否执行 dbha 探针重启逻辑，默认 false 表示跳过
+	// 仅当置为 true 时，DoRestartDBHAProbe 才会真正执行重启动作
+	RestartDBHAProbe bool `json:"restart_dbha_probe"`
+	// DBHAAdminEndpoints dbha 探针 gen-config 使用的 admin-endpoints，多个用逗号分隔
+	// 仅在 RestartDBHAProbe=true 时必填
+	DBHAAdminEndpoints string `json:"dbha_admin_endpoints"`
 }
 
 // Example 样例
@@ -227,4 +233,42 @@ func (c *ClearInstanceConfigComp) clearMySQLMonitor() {
 
 	logger.Info("remove mysql monitor config finish")
 	return
+}
+
+// DoRestartDBHAProbe 重启 dbha 探针
+// 0. 若 RestartDBHAProbe 开关未打开，则直接跳过（默认行为）
+// 1. 若探针目录不存在，则跳过
+// 2. 依次执行 stop-probe.sh、gen-config、start-probe.sh
+// 3. 探针启动后做 health 检查以及进程存活检查
+func (c *ClearInstanceConfigComp) DoRestartDBHAProbe() (err error) {
+	if !c.Params.RestartDBHAProbe {
+		logger.Info("restart_dbha_probe is disabled, skip restart dbha probe")
+		return nil
+	}
+
+	probeDir := cst.DBHAProbeInstallDir
+	if !cmutil.FileExists(probeDir) {
+		logger.Info("probe not deployed on this host [%s], skip restart", probeDir)
+		return nil
+	}
+
+	if strings.TrimSpace(c.Params.DBHAAdminEndpoints) == "" {
+		err = errors.Errorf("dbha_admin_endpoints is required for restarting dbha probe")
+		logger.Error(err.Error())
+		return err
+	}
+
+	// 使用 set -e 保证任一命令失败即中断；cd 到探针目录后按顺序执行
+	cmd := fmt.Sprintf(
+		`set -e; cd %s && ./stop-probe.sh && ./bin/dbha-probe gen-config --admin-endpoints '%s' -o etc/probe.yaml && ./start-probe.sh && ./bin/dbha-probe health && ps -ef | grep dbha-probe`,
+		probeDir, c.Params.DBHAAdminEndpoints,
+	)
+
+	stdout, err := osutil.ExecShellCommand(false, cmd)
+	if err != nil {
+		logger.Error("restart dbha probe failed: %s, output: %s", err.Error(), stdout)
+		return err
+	}
+	logger.Info("restart dbha probe success, output: %s", stdout)
+	return nil
 }
