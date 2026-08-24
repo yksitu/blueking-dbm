@@ -19,6 +19,7 @@ from typing import List
 from django.conf import settings
 from django.utils.translation import gettext as _
 
+from backend import env
 from backend.constants import IP_PORT_DIVIDER
 from backend.core.consts import BK_PKG_INSTALL_PATH
 from backend.core.encrypt.constants import AsymmetricCipherConfigType
@@ -1215,6 +1216,7 @@ class MysqlActPayload(PayloadHandler, ProxyActPayload, TBinlogDumperActPayload):
         拼接获取集群维度清理周边配置的payload，如例行校验、例行备份、rotate_binlog等
         clear_ports 是代表这次需要清理实例端口, 通过单据的cluster信息捕捉
         兼容单节点集群和主从集群的场景
+        增加对DBHA v2的兼容：处理DBHA探针的配置
         """
         ports = []
         machine = Machine.objects.get(ip=kwargs["ip"])
@@ -1250,7 +1252,11 @@ class MysqlActPayload(PayloadHandler, ProxyActPayload, TBinlogDumperActPayload):
             "action": DBActuatorActionEnum.MysqlClearSurroundingConfig.value,
             "payload": {
                 "general": {"runtime_account": self.account},
-                "extend": {"clear_ports": ports, "machine_type": machine.machine_type},
+                "extend": {
+                    "clear_ports": ports,
+                    "machine_type": machine.machine_type,
+                    "clear_dbha_probe_config": env.ENABLE_DBHA_V2,
+                },
             },
         }
 
