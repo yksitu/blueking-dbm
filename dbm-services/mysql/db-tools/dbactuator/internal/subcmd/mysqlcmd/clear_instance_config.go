@@ -69,8 +69,8 @@ func (g *ClearInstanceConfigAct) Run() (err error) {
 			Func:    g.Service.DoClear,
 		},
 		{
-			FunName: "重新加载DBHA探针配置",
-			Func:    g.Service.DoRestartDBHAProbe,
+			FunName: "清理DBHA探针端口配置",
+			Func:    g.Service.DoClearDBHAProbeConfig,
 		},
 	}
 

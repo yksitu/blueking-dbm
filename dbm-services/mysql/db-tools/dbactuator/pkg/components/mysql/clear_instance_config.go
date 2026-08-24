@@ -8,13 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"path"
-	"strings"
 
 	"dbm-services/common/go-pubpkg/cmutil"
 	"dbm-services/common/go-pubpkg/logger"
 	"dbm-services/mysql/db-tools/dbactuator/pkg/components"
 	"dbm-services/mysql/db-tools/dbactuator/pkg/core/cst"
 	"dbm-services/mysql/db-tools/dbactuator/pkg/tools"
+	"dbm-services/mysql/db-tools/dbactuator/pkg/util"
 	"dbm-services/mysql/db-tools/dbactuator/pkg/util/osutil"
 
 	"github.com/pkg/errors"
@@ -31,12 +31,9 @@ type ClearInstanceConfigComp struct {
 type ClearInstanceConfigParam struct {
 	ClearPorts  []int  `json:"clear_ports" validate:"required,gt=0,dive"`
 	MachineType string `json:"machine_type"`
-	// RestartDBHAProbe 是否执行 dbha 探针重启逻辑，默认 false 表示跳过
-	// 仅当置为 true 时，DoRestartDBHAProbe 才会真正执行重启动作
-	RestartDBHAProbe bool `json:"restart_dbha_probe"`
-	// DBHAAdminEndpoints dbha 探针 gen-config 使用的 admin-endpoints，多个用逗号分隔
-	// 仅在 RestartDBHAProbe=true 时必填
-	DBHAAdminEndpoints string `json:"dbha_admin_endpoints"`
+	// ClearDBHAProbeConfig 是否执行清理 dbha 探针端口配置的逻辑，默认 false 表示跳过
+	// 仅当置为 true 时，DoClearDBHAProbeConfig 才会真正执行清理动作
+	ClearDBHAProbeConfig bool `json:"clear_dbha_probe_config"`
 }
 
 // Example 样例
@@ -186,7 +183,7 @@ func (c *ClearInstanceConfigComp) clearRotateBinlog() (err error) {
 		logger.Info("%s not exists, skip", binPath)
 		return nil
 	}
-	clearPortString := strings.Replace(strings.Trim(fmt.Sprint(c.Params.ClearPorts), "[]"), " ", ",", -1)
+	clearPortString := util.IntSlice2String(c.Params.ClearPorts, ",")
 	cmd := fmt.Sprintf(
 		`%s -c %s --removeConfig %s`, binPath, configFile, clearPortString,
 	)
@@ -235,40 +232,42 @@ func (c *ClearInstanceConfigComp) clearMySQLMonitor() {
 	return
 }
 
-// DoRestartDBHAProbe 重启 dbha 探针
-// 0. 若 RestartDBHAProbe 开关未打开，则直接跳过（默认行为）
+// DoClearDBHAProbeConfig 清理 dbha 探针指定端口的配置
+// 0. 若 ClearDBHAProbeConfig 开关未打开，则直接跳过（默认行为）
 // 1. 若探针目录不存在，则跳过
-// 2. 依次执行 stop-probe.sh、gen-config、start-probe.sh
-// 3. 探针启动后做 health 检查以及进程存活检查
-func (c *ClearInstanceConfigComp) DoRestartDBHAProbe() (err error) {
-	if !c.Params.RestartDBHAProbe {
-		logger.Info("restart_dbha_probe is disabled, skip restart dbha probe")
+// 2. 若 ClearPorts 为空，则跳过
+// 3. 执行 ./bin/dbha-probe gen-config --clear-port <ports> 清理指定端口的配置
+func (c *ClearInstanceConfigComp) DoClearDBHAProbeConfig() (err error) {
+	if !c.Params.ClearDBHAProbeConfig {
+		logger.Info("clear_dbha_probe_config is disabled, skip clear dbha probe config")
 		return nil
 	}
 
 	probeDir := cst.DBHAProbeInstallDir
 	if !cmutil.FileExists(probeDir) {
-		logger.Info("probe not deployed on this host [%s], skip restart", probeDir)
+		logger.Info("probe not deployed on this host [%s], skip clear probe config", probeDir)
 		return nil
 	}
 
-	if strings.TrimSpace(c.Params.DBHAAdminEndpoints) == "" {
-		err = errors.Errorf("dbha_admin_endpoints is required for restarting dbha probe")
-		logger.Error(err.Error())
-		return err
+	if len(c.Params.ClearPorts) == 0 {
+		logger.Info("clear_ports is empty, skip clear dbha probe config")
+		return nil
 	}
 
-	// 使用 set -e 保证任一命令失败即中断；cd 到探针目录后按顺序执行
+	// 将端口列表转成逗号分隔的字符串，例如 [10000 20000] -> "10000,20000"
+	clearPortString := util.IntSlice2String(c.Params.ClearPorts, ",")
+
+	// 使用 set -e 保证命令失败即中断；cd 到探针目录后执行 gen-config --clear-port
 	cmd := fmt.Sprintf(
-		`set -e; cd %s && ./stop-probe.sh && ./bin/dbha-probe gen-config --admin-endpoints '%s' -o etc/probe.yaml && ./start-probe.sh && ./bin/dbha-probe health && ps -ef | grep dbha-probe`,
-		probeDir, c.Params.DBHAAdminEndpoints,
+		`set -e; cd %s && ./bin/dbha-probe gen-config --clear-port %s`,
+		probeDir, clearPortString,
 	)
 
 	stdout, err := osutil.ExecShellCommand(false, cmd)
 	if err != nil {
-		logger.Error("restart dbha probe failed: %s, output: %s", err.Error(), stdout)
+		logger.Error("clear dbha probe config failed: %s, output: %s", err.Error(), stdout)
 		return err
 	}
-	logger.Info("restart dbha probe success, output: %s", stdout)
+	logger.Info("clear dbha probe config success [%s], output: %s", clearPortString, stdout)
 	return nil
 }
