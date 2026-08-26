@@ -135,9 +135,9 @@ WHILE @@FETCH_STATUS = 0
     IF @productName = N'SQL Server'
         SET @sql=@sql+CHAR(13)+CHAR(10) + 'EXEC master.dbo.sp_addlinkedserver @server = N'''+@servername+''', @srvproduct=N''SQL Server'''
     ELSE IF LEN(@datasource) > 0
-        SET @sql=@sql+CHAR(13)+CHAR(10) + 'EXEC master.dbo.sp_addlinkedserver @server = N'''+@servername+''', @srvproduct=N'''+@productName+''', @provider=N'''+@provider+''', @datasrc=N'''+@datasource+''''+CASE WHEN @catalog IS NOT NULL AND @catalog <> N'' THEN ', @catalog=N'''+@catalog+'''' ELSE '''' END
+        SET @sql=@sql+CHAR(13)+CHAR(10) + 'EXEC master.dbo.sp_addlinkedserver @server = N'''+@servername+''', @srvproduct=N'''+@productName+''', @provider=N'''+@provider+''', @datasrc=N'''+@datasource+''''+CASE WHEN @catalog IS NOT NULL AND @catalog <> N'' THEN ', @catalog=N'''+@catalog+'''' ELSE '' END
     ELSE
-        SET @sql=@sql+CHAR(13)+CHAR(10) + 'EXEC master.dbo.sp_addlinkedserver @server = N'''+@servername+''', @srvproduct=N'''+@productName+''''+CASE WHEN @catalog IS NOT NULL AND @catalog <> N'' THEN ', @catalog=N'''+@catalog+'''' ELSE '''' END
+        SET @sql=@sql+CHAR(13)+CHAR(10) + 'EXEC master.dbo.sp_addlinkedserver @server = N'''+@servername+''', @srvproduct=N'''+@productName+''''+CASE WHEN @catalog IS NOT NULL AND @catalog <> N'' THEN ', @catalog=N'''+@catalog+'''' ELSE '' END
 
     -- NOTE: sp_addlinkedsrvlogin is intentionally NOT emitted here.
     -- The Go layer will append the correct login statement per linked server

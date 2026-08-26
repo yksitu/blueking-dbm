@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"strings"
 
 	"dbm-services/common/go-pubpkg/cmutil"
 	"dbm-services/common/go-pubpkg/logger"
@@ -34,6 +35,9 @@ type ClearInstanceConfigParam struct {
 	// ClearDBHAProbeConfig 是否执行清理 dbha 探针端口配置的逻辑，默认 false 表示跳过
 	// 仅当置为 true 时，DoClearDBHAProbeConfig 才会真正执行清理动作
 	ClearDBHAProbeConfig bool `json:"clear_dbha_probe_config"`
+	// DBHAAdminEndpoints dbha 探针 gen-config 使用的 admin-endpoints，多个用逗号分隔
+	// 仅在 ClearDBHAProbeConfig=true 时使用
+	DBHAAdminEndpoints string `json:"dbha_admin_endpoints"`
 }
 
 // Example 样例
@@ -254,13 +258,19 @@ func (c *ClearInstanceConfigComp) DoClearDBHAProbeConfig() (err error) {
 		return nil
 	}
 
+	if strings.TrimSpace(c.Params.DBHAAdminEndpoints) == "" {
+		err = errors.Errorf("dbha_admin_endpoints is required for clearing dbha probe config")
+		logger.Error(err.Error())
+		return err
+	}
+
 	// 将端口列表转成逗号分隔的字符串，例如 [10000 20000] -> "10000,20000"
 	clearPortString := util.IntSlice2String(c.Params.ClearPorts, ",")
 
-	// 使用 set -e 保证命令失败即中断；cd 到探针目录后执行 gen-config --clear-port
+	// 使用 set -e 保证命令失败即中断；cd 到探针目录后执行 gen-config --admin-endpoints --clear-port
 	cmd := fmt.Sprintf(
-		`set -e; cd %s && ./bin/dbha-probe gen-config --clear-port %s`,
-		probeDir, clearPortString,
+		`set -e; cd %s && ./bin/dbha-probe gen-config --admin-endpoints '%s' --clear-port %s`,
+		probeDir, c.Params.DBHAAdminEndpoints, clearPortString,
 	)
 
 	stdout, err := osutil.ExecShellCommand(false, cmd)
