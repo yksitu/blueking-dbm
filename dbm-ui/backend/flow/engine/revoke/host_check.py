@@ -1,0 +1,922 @@
+# -*- coding: utf-8 -*-
+"""
+TencentBlueKing is pleased to support the open source community by making 蓝鲸智云-DB管理系统(BlueKing-BK-DBM) available.
+Copyright (C) 2017-2023 THL A29 Limited, a Tencent company. All rights reserved.
+Licensed under the MIT License (the "License"); you may not use this file except in compliance with the License.
+You may obtain a copy of the License at https://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
+an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+主机退回资源池判定公共类。
+
+模块职责：
+  - 提供 revoke 流程复用的 4 个只读判定方法：
+    1) check_in_ticket_scope    —— 机器是否仍在当前单据管理范围内
+    2) check_clb_mapping        —— IP 在 CLB 侧是否仍有注册
+    3) check_dns_mapping        —— IP 在 DNS 服务侧是否仍有解析
+    4) check_dbm_metadata       —— DBM 元数据（Machine/Instance/Cluster）是否闭合
+
+设计要点：
+  - **只读、无副作用**：所有方法不写 DB、不发起变更类 RPC、不写 FlowOutputHandler
+  - **外部真相为准**：check_clb_mapping / check_dns_mapping 完全不查 DBM 元数据，
+    只以 (ip, region) / (ip, bk_cloud_id) 为主键去外部服务查真相；
+    避免"元数据已清 + 外部残留"这一"最危险的中间态"被漏检
+  - **不预留进程检查钩子**：进程存活性由 dbactor 侧独立实现，本类保持职责单一
+  - **异常不上抛**：外部服务调用异常统一封装为 reason_code="check_error"，
+    保证 revoke 流程主链路不被此类检查中断
+  - **结构化结果三段职责**：
+      * reason_code —— 面向机器（枚举分支）
+      * reason      —— 面向人（可读文本），必填非空
+      * evidence    —— 面向排查（结构化证据）
+
+边界：
+  - 本模块仅做"判定"，不做"清理"；具体清理/退回动作由上层 revoke flow 编排
+  - 4 个方法结果正交、互不掩盖，元数据缺失不影响外部服务判定的独立报告
+"""
+import logging
+import traceback
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+from backend.components import CCApi
+from backend.components.db_name_service.client import NameServiceApi
+from backend.components.dns.client import DnsApi
+from backend.db_dirty.models import MachineEvent
+from backend.db_meta.models import Machine
+from backend.db_services.cmdb.biz import get_or_create_resource_module
+from backend.flow.engine.revoke.exception import RevokeFlowBaseException
+from backend.ticket.models import Ticket
+
+logger = logging.getLogger("flow")
+
+
+class HostCheckReasonCode:
+    """判定结果 reason_code 枚举常量集合。
+
+    职责：集中定义 4 个判定方法可能返回的所有 reason_code 字符串，
+      供上层做分支处理（if/switch）时使用；面向机器、非展示文本。
+    """
+
+    #: 判定通过
+    OK: str = "ok"
+
+    #: 需求 2：无任何主机事件记录
+    NO_MACHINE_EVENT: str = "no_machine_event"
+    #: 需求 2：最近一次事件关联单据与当前单据不一致
+    TICKET_MISMATCH: str = "ticket_mismatch"
+    #: 需求 2：CC 侧查不到该主机
+    CC_HOST_NOT_FOUND: str = "cc_host_not_found"
+    #: 需求 2：CC 侧模块与资源池模块不一致
+    MODULE_MISMATCH: str = "module_mismatch"
+
+    #: 需求 3：未提供 region，无法判定 CLB 注册状态
+    NO_REGION_INPUT: str = "no_region_input"
+    #: 需求 3：IP 已注册在 CLB 上
+    IP_REGISTERED_IN_CLB: str = "ip_registered_in_clb"
+    #: 需求 3：IP 未注册在 CLB 上
+    IP_NOT_REGISTERED_IN_CLB: str = "ip_not_registered_in_clb"
+
+    #: 需求 4：IP 仍有 DNS 记录
+    IP_HAS_DNS_RECORD: str = "ip_has_dns_record"
+    #: 需求 4：IP 无 DNS 记录
+    IP_NO_DNS_RECORD: str = "ip_no_dns_record"
+
+    #: 需求 5：Machine 表不存在
+    NO_MACHINE: str = "no_machine"
+    #: 需求 5：Machine 存在但无任何 Instance 记录
+    NO_INSTANCE: str = "no_instance"
+    #: 需求 5：任一 Instance 的 port 为 0 / None
+    INSTANCE_PORT_INVALID: str = "instance_port_invalid"
+    #: 需求 5：任一 Instance 未绑定到任何 Cluster
+    INSTANCE_NO_CLUSTER: str = "instance_no_cluster"
+
+    #: 需求 7（MySQL 主机进程存活检查）：主机上仍有 MySQL 家族进程 LISTEN
+    #: （方案已收敛为"主机维度"扫描：只要命中白名单中任一 comm 即视为存活，
+    #: 不再区分 process_missing / port_hijacked / partial_alive）
+    MYSQL_STILL_ALIVE: str = "mysql_still_alive"
+
+    #: 通用兜底：外部服务异常 / DB 查询异常
+    CHECK_ERROR: str = "check_error"
+
+
+@dataclass
+class HostCheckResult:
+    """单次判定的结构化结果。
+
+    字段职责三分：
+      * ``reason_code`` 面向机器（枚举分支）
+      * ``reason``      面向人（展示文本，必填非空）
+      * ``evidence``    面向排查（结构化证据）
+
+    边界：
+      - ``reason`` 强制非空字符串，若为空将在 ``__post_init__`` 抛异常
+      - ``evidence`` 允许为空 dict，但不允许为 None
+    """
+
+    #: 判定是否通过
+    passed: bool
+    #: 结果分类枚举字符串，取值见 :class:`HostCheckReasonCode`
+    reason_code: str
+    #: 人类可读的原因说明，无论 passed 真假都必填非空
+    reason: str
+    #: 判定依据的关键证据字段，用于详细溯源
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """校验 ``reason`` 非空、``evidence`` 非 None。
+
+        :return: None
+        边界：
+          - ``reason`` 为 None / 空串 / 纯空白 -> raise RevokeFlowBaseException
+          - ``evidence`` 为 None -> 自动置为 {}
+        """
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise RevokeFlowBaseException(
+                "HostCheckResult.reason must be non-empty string, got: {!r}".format(self.reason)
+            )
+        if self.evidence is None:
+            self.evidence = {}
+
+
+#: check_dns_mapping 中 evidence.records 仅保留的白名单字段
+_DNS_RECORD_KEEP_FIELDS: Tuple[str, ...] = ("domain_name", "port", "status", "last_change_time")
+
+#: 日志脱敏时需要剔除的敏感字段名（进程内小写匹配）
+_SENSITIVE_FIELD_NAMES: frozenset = frozenset(
+    {"clb_token", "servicetoken", "aliastoken", "token", "secret", "password"}
+)
+
+
+class HostRevokeChecker:
+    """主机退回资源池判定公共类。
+
+    职责：
+      - 收敛 4 个独立、只读、无副作用的判定方法，供多个 revoke flow 复用
+      - 每个判定方法各自返回 :class:`HostCheckResult`，结果正交互不掩盖
+      - 外部服务调用异常统一封装为 CHECK_ERROR，不向上抛出中断流程
+
+    使用方式：
+        checker = HostRevokeChecker(
+            root_id="root-xxx",
+            ticket=ticket_obj,
+            bk_biz_id=100,
+            bk_cloud_id=0,
+            ip="1.2.3.4",
+            bk_host_id=123456,
+        )
+        r1 = checker.check_in_ticket_scope()
+        r2 = checker.check_clb_mapping(regions=["南京"])
+        r3 = checker.check_dns_mapping()
+        r4 = checker.check_dbm_metadata()
+
+    线程安全：**非线程安全**（进程内幂等缓存字典为可变状态），
+      单个 revoke flow 内串行使用即可；如需并发，请为每个线程各起一个实例。
+
+    边界：
+      - 构造入参任一为空或类型不合法 -> 抛 :class:`RevokeFlowBaseException`
+      - 判定方法内部任何 DB / API 异常均被捕获封装，不向上抛出
+    """
+
+    def __init__(
+        self,
+        root_id: str,
+        ticket: Ticket,
+        bk_biz_id: int,
+        bk_cloud_id: int,
+        ip: str,
+        bk_host_id: int,
+    ) -> None:
+        """初始化判定器：只做赋值 + 参数校验，不做 IO/RPC/DB 调用。
+
+        :param root_id: flow root_id，用于日志追踪
+        :param ticket: 当前单据对象，需带有 ``id`` 属性
+        :param bk_biz_id: 业务 id，> 0
+        :param bk_cloud_id: 云区域 id，>= 0
+        :param ip: 主机 IP，非空字符串
+        :param bk_host_id: 主机 id，> 0
+        :return: None
+        边界：
+          - 任一参数为空、类型不合法 -> raise RevokeFlowBaseException
+        """
+        if not isinstance(root_id, str) or not root_id.strip():
+            raise RevokeFlowBaseException("root_id must be non-empty string")
+        if ticket is None or not hasattr(ticket, "id"):
+            raise RevokeFlowBaseException("ticket must be a Ticket instance with `id` attribute")
+        if not isinstance(bk_biz_id, int) or bk_biz_id <= 0:
+            raise RevokeFlowBaseException("bk_biz_id must be positive int")
+        if not isinstance(bk_cloud_id, int) or bk_cloud_id < 0:
+            raise RevokeFlowBaseException("bk_cloud_id must be non-negative int")
+        if not isinstance(ip, str) or not ip.strip():
+            raise RevokeFlowBaseException("ip must be non-empty string")
+        if not isinstance(bk_host_id, int) or bk_host_id <= 0:
+            raise RevokeFlowBaseException("bk_host_id must be positive int")
+
+        self.root_id: str = root_id
+        self.ticket: Ticket = ticket
+        self.bk_biz_id: int = bk_biz_id
+        self.bk_cloud_id: int = bk_cloud_id
+        self.ip: str = ip
+        self.bk_host_id: int = bk_host_id
+
+        # 进程内幂等缓存：避免同一实例内对同一 key 重复查询外部服务
+        # key 结构参见各方法内注释
+        self._cc_cache: Dict[int, Optional[Dict[str, Any]]] = {}
+        self._clb_cache: Dict[Tuple[str, str], Any] = {}
+        self._dns_cache: Dict[Tuple[str, int], Any] = {}
+
+    # ---------------- 私有工具 ----------------
+
+    def _sanitize_evidence(self, evidence: Any) -> Any:
+        """递归剔除敏感字段，用于日志与最终返回。
+
+        :param evidence: 任意结构（dict / list / 标量）
+        :return: 已剔除敏感字段的同结构对象
+        边界：
+          - 匹配以 :data:`_SENSITIVE_FIELD_NAMES` 为准（大小写不敏感）
+          - 非 dict/list 直接返回原值
+        """
+        if isinstance(evidence, dict):
+            cleaned: Dict[str, Any] = {}
+            for k, v in evidence.items():
+                if isinstance(k, str) and k.lower() in _SENSITIVE_FIELD_NAMES:
+                    continue
+                cleaned[k] = self._sanitize_evidence(v)
+            return cleaned
+        if isinstance(evidence, list):
+            return [self._sanitize_evidence(item) for item in evidence]
+        return evidence
+
+    def _log_result(self, method: str, result: HostCheckResult) -> None:
+        """按需求 7 的格式打印一行 INFO 汇总日志（含 reason）。
+
+        :param method: 判定方法名，用于日志检索
+        :param result: 判定结果对象
+        :return: None
+        边界：
+          - passed=False 且 reason_code=CHECK_ERROR -> WARNING 级别
+          - 其他情况 -> INFO 级别
+        """
+        line = (
+            "[HostRevokeChecker][{root_id}][{ip}][{method}] "
+            'passed={passed} reason_code={reason_code} reason="{reason}" evidence={evidence}'
+        ).format(
+            root_id=self.root_id,
+            ip=self.ip,
+            method=method,
+            passed=result.passed,
+            reason_code=result.reason_code,
+            reason=result.reason,
+            evidence=result.evidence,
+        )
+        if not result.passed and result.reason_code == HostCheckReasonCode.CHECK_ERROR:
+            logger.warning(line)
+        else:
+            logger.info(line)
+
+    def _build_result(
+        self,
+        method: str,
+        passed: bool,
+        reason_code: str,
+        reason: str,
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> HostCheckResult:
+        """统一构造 :class:`HostCheckResult` 并触发日志。
+
+        :param method: 判定方法名
+        :param passed: 判定是否通过
+        :param reason_code: 见 :class:`HostCheckReasonCode`
+        :param reason: 人类可读原因（必填非空）
+        :param evidence: 结构化证据；默认 {}
+        :return: 已脱敏的 HostCheckResult
+        边界：
+          - evidence 内的敏感字段（如 clb_token）会被剔除
+        """
+        evidence = evidence or {}
+        result = HostCheckResult(
+            passed=passed,
+            reason_code=reason_code,
+            reason=reason,
+            evidence=self._sanitize_evidence(evidence),
+        )
+        self._log_result(method=method, result=result)
+        return result
+
+    # ---------------- 需求 2：管理范围判定 ----------------
+
+    def check_in_ticket_scope(self, use_cache: bool = False) -> HostCheckResult:
+        """判定机器是否仍在当前单据的管理范围内。
+
+        怎么做（顺序短路）：
+          1) 查 ``MachineEvent`` 最近一次事件，无记录 -> NO_MACHINE_EVENT
+          2) 最近事件 ticket_id != 当前单据 id -> TICKET_MISMATCH
+          3) 调 CCApi 查 bk_module_id，无记录 -> CC_HOST_NOT_FOUND
+          4) bk_module_id != 资源池模块 id -> MODULE_MISMATCH
+          5) 全通过 -> OK
+
+        :param use_cache: 是否对同一 bk_host_id 的 CC 查询结果做进程内缓存，默认 False
+        :return: :class:`HostCheckResult`，reason_code 见 :class:`HostCheckReasonCode`
+        边界：
+          - CC 接口异常 -> CHECK_ERROR，evidence.error 携带异常摘要，不向上抛
+          - DB 查询异常 -> CHECK_ERROR
+        """
+        method = "check_in_ticket_scope"
+        current_ticket_id: int = int(self.ticket.id)
+
+        # 步骤 1：查 MachineEvent 最近一次事件
+        try:
+            last_event = MachineEvent.objects.filter(bk_host_id=self.bk_host_id).order_by("-id").first()
+        except Exception as err:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.CHECK_ERROR,
+                reason="MachineEvent 查询异常：{}".format(err),
+                evidence={"bk_host_id": self.bk_host_id, "error": str(err)},
+            )
+
+        if last_event is None:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.NO_MACHINE_EVENT,
+                reason="机器无任何主机事件记录，无法确认归属（bk_host_id={}）".format(self.bk_host_id),
+                evidence={"bk_host_id": self.bk_host_id},
+            )
+
+        # 步骤 2：ticket_id 一致性
+        last_event_ticket_id: Optional[int] = last_event.ticket_id
+        if last_event_ticket_id != current_ticket_id:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.TICKET_MISMATCH,
+                reason="该机器最近一次事件关联单据是 {}，与当前单据 {} 不一致".format(last_event_ticket_id, current_ticket_id),
+                evidence={
+                    "last_event_id": last_event.id,
+                    "last_event_type": last_event.event,
+                    "last_event_ticket_id": last_event_ticket_id,
+                    "current_ticket_id": current_ticket_id,
+                },
+            )
+
+        # 步骤 3：查 CC find_host_biz_relations
+        cc_records: List[Dict[str, Any]]
+        try:
+            if use_cache and self.bk_host_id in self._cc_cache:
+                cc_records = self._cc_cache[self.bk_host_id] or []
+            else:
+                cc_records = CCApi.find_host_biz_relations({"bk_host_id": [self.bk_host_id]}) or []
+                if use_cache:
+                    self._cc_cache[self.bk_host_id] = cc_records
+        except Exception as err:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.CHECK_ERROR,
+                reason="CC 接口调用异常：{}".format(err),
+                evidence={
+                    "bk_host_id": self.bk_host_id,
+                    "error": str(err),
+                    "trace": traceback.format_exc(limit=3),
+                },
+            )
+
+        if not cc_records:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.CC_HOST_NOT_FOUND,
+                reason="CC 查询不到该主机（bk_host_id={}）".format(self.bk_host_id),
+                evidence={"bk_host_id": self.bk_host_id},
+            )
+
+        # 步骤 4：bk_module_id 与资源池模块一致性（严格版：任一记录不匹配即视为脱离）
+        try:
+            resource_bk_module_id: int = int(get_or_create_resource_module())
+        except Exception as err:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.CHECK_ERROR,
+                reason="获取资源池模块 id 失败：{}".format(err),
+                evidence={"error": str(err)},
+            )
+
+        actual_bk_module_ids: List[int] = [int(rec.get("bk_module_id") or 0) for rec in cc_records]
+        mismatched = [mid for mid in actual_bk_module_ids if mid != resource_bk_module_id]
+        if mismatched:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.MODULE_MISMATCH,
+                reason="该机器当前 CC 模块 {} 与资源池模块 {} 不一致".format(mismatched, resource_bk_module_id),
+                evidence={
+                    "actual_bk_module_id": actual_bk_module_ids,
+                    "resource_bk_module_id": resource_bk_module_id,
+                },
+            )
+
+        # 步骤 5：全通过
+        return self._build_result(
+            method=method,
+            passed=True,
+            reason_code=HostCheckReasonCode.OK,
+            reason=("机器仍在本单据管理范围内：最近事件 ticket_id={}，CC 模块={}，与资源池模块={} 一致").format(
+                current_ticket_id, actual_bk_module_ids, resource_bk_module_id
+            ),
+            evidence={
+                "last_event_ticket_id": last_event_ticket_id,
+                "current_ticket_id": current_ticket_id,
+                "bk_module_id": actual_bk_module_ids,
+                "resource_bk_module_id": resource_bk_module_id,
+            },
+        )
+
+    # ---------------- 需求 3：CLB 映射判定 ----------------
+
+    def check_clb_mapping(self, regions: List[str], use_cache: bool = False) -> HostCheckResult:
+        """判定 IP 是否已注册在 CLB 后端上（完全不查 DBM 元数据）。
+
+        怎么做：
+          1) regions 全空 -> NO_REGION_INPUT（不使用 True 兜底）
+          2) 遍历每个有效 region，调 NameServiceApi.clb_check_clb_register_target_by_ip
+          3) 任一 region 的 clbinfos 存在 registerclb==True 且 ip 匹配 -> 短路 IP_REGISTERED_IN_CLB
+          4) 单个 region 抛异常时捕获、记入 failed_regions，继续遍历后续 region
+          5) 遍历结束无命中但存在 failed_regions -> CHECK_ERROR（保守）
+          6) 否则 -> IP_NOT_REGISTERED_IN_CLB
+
+        :param regions: 需要检查的 region 列表；由调用方决定 region 来源
+        :param use_cache: 是否对 (ip, region) 命中缓存，默认 False
+        :return: :class:`HostCheckResult`
+        边界：
+          - regions 内空字符串会被过滤；若全部为空视为 NO_REGION_INPUT
+          - 单个 region 异常不中断整体遍历
+        """
+        method = "check_clb_mapping"
+
+        # 步骤 1：region 输入合法性
+        if not regions:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.NO_REGION_INPUT,
+                reason="未提供 region，无法判定 CLB 注册状态",
+                evidence={"ip": self.ip, "regions": regions},
+            )
+        valid_regions: List[str] = [r for r in regions if isinstance(r, str) and r.strip()]
+        if not valid_regions:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.NO_REGION_INPUT,
+                reason="未提供 region，无法判定 CLB 注册状态",
+                evidence={"ip": self.ip, "regions": regions},
+            )
+
+        all_responses: Dict[str, Any] = {}
+        failed_regions: Dict[str, str] = {}
+        matched_clbid: Optional[str] = None
+        matched_region: Optional[str] = None
+
+        # 步骤 2：遍历 region
+        for region in valid_regions:
+            cache_key: Tuple[str, str] = (self.ip, region)
+            try:
+                if use_cache and cache_key in self._clb_cache:
+                    resp = self._clb_cache[cache_key]
+                else:
+                    resp = NameServiceApi.clb_check_clb_register_target_by_ip({"region": region, "ips": [self.ip]})
+                    if use_cache:
+                        self._clb_cache[cache_key] = resp
+            except Exception as err:
+                failed_regions[region] = str(err)
+                logger.warning(
+                    "[HostRevokeChecker][{}][{}][check_clb_mapping] region={} api error: {}".format(
+                        self.root_id, self.ip, region, err
+                    )
+                )
+                continue
+
+            all_responses[region] = resp
+
+            # 步骤 3：解析 clbinfos
+            clbinfos: List[Dict[str, Any]] = []
+            if isinstance(resp, dict):
+                # 注：接口注释显示返回结构 data.clbinfos；但生产代码曾出现 resp["clbid"] 直读的用法，
+                # 这里做兼容：优先取 clbinfos，缺失则视为无注册（配合 registerclb 严格判定）
+                if isinstance(resp.get("clbinfos"), list):
+                    clbinfos = resp["clbinfos"]
+                elif isinstance(resp.get("data"), dict) and isinstance(resp["data"].get("clbinfos"), list):
+                    clbinfos = resp["data"]["clbinfos"]
+
+            for info in clbinfos:
+                if not isinstance(info, dict):
+                    continue
+                if info.get("registerclb") is True and info.get("ip") == self.ip:
+                    matched_clbid = info.get("clbid")
+                    matched_region = region
+                    break
+
+            if matched_clbid is not None:
+                break
+
+        # 步骤 3 短路命中
+        if matched_clbid is not None:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.IP_REGISTERED_IN_CLB,
+                reason="该机器 IP 已注册在 CLB {} 上（region={}），需先解除绑定".format(matched_clbid, matched_region),
+                evidence={
+                    "ip": self.ip,
+                    "matched_region": matched_region,
+                    "matched_clbid": matched_clbid,
+                    "all_responses": all_responses,
+                },
+            )
+
+        # 步骤 5：无命中但存在 failed_regions
+        if failed_regions:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.CHECK_ERROR,
+                reason="部分 region 查询失败，从保守出发视为不干净（failed_regions={}）".format(list(failed_regions.keys())),
+                evidence={
+                    "ip": self.ip,
+                    "failed_regions": list(failed_regions.keys()),
+                    "errors": failed_regions,
+                    "all_responses": all_responses,
+                },
+            )
+
+        # 步骤 6：全部干净
+        return self._build_result(
+            method=method,
+            passed=True,
+            reason_code=HostCheckReasonCode.IP_NOT_REGISTERED_IN_CLB,
+            reason="IP 在 checked_regions={} 中均未注册到 CLB".format(valid_regions),
+            evidence={
+                "ip": self.ip,
+                "checked_regions": valid_regions,
+                "all_responses": all_responses,
+            },
+        )
+
+    # ---------------- 需求 4：DNS 映射判定 ----------------
+
+    def check_dns_mapping(self, use_cache: bool = False) -> HostCheckResult:
+        """判定 IP 在 DNS 服务侧是否仍有域名解析（完全不查 DBM 元数据）。
+
+        怎么做：
+          1) 调 DnsApi.get_domain({"ip", "bk_cloud_id"}) 反查
+          2) 返回值非 dict / 缺 detail 键 -> CHECK_ERROR
+          3) detail 为空 -> IP_NO_DNS_RECORD
+          4) detail 非空 -> IP_HAS_DNS_RECORD，records 仅保留定位字段
+
+        :param use_cache: 是否对 (ip, bk_cloud_id) 命中缓存，默认 False
+        :return: :class:`HostCheckResult`
+        边界：
+          - DnsApi 异常 -> CHECK_ERROR（保守策略，视为不干净）
+          - passed=False 分支会在日志中打印完整 domain_name 列表
+        """
+        method = "check_dns_mapping"
+        cache_key: Tuple[str, int] = (self.ip, self.bk_cloud_id)
+
+        # 步骤 1：调用 DNS 接口
+        try:
+            if use_cache and cache_key in self._dns_cache:
+                resp = self._dns_cache[cache_key]
+            else:
+                resp = DnsApi.get_domain({"ip": self.ip, "bk_cloud_id": self.bk_cloud_id})
+                if use_cache:
+                    self._dns_cache[cache_key] = resp
+        except Exception as err:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.CHECK_ERROR,
+                reason="DNS 接口调用失败：{}".format(err),
+                evidence={
+                    "ip": self.ip,
+                    "bk_cloud_id": self.bk_cloud_id,
+                    "error": str(err),
+                    "trace": traceback.format_exc(limit=3),
+                },
+            )
+
+        # 步骤 2：返回结构合法性
+        if not isinstance(resp, dict) or "detail" not in resp:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.CHECK_ERROR,
+                reason="DNS 接口返回结构异常（缺少 detail 键或非 dict）",
+                evidence={
+                    "ip": self.ip,
+                    "bk_cloud_id": self.bk_cloud_id,
+                    "raw_response": resp,
+                },
+            )
+
+        detail = resp.get("detail") or []
+        if not isinstance(detail, list):
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.CHECK_ERROR,
+                reason="DNS 接口返回 detail 字段非 list",
+                evidence={
+                    "ip": self.ip,
+                    "bk_cloud_id": self.bk_cloud_id,
+                    "raw_response": resp,
+                },
+            )
+
+        # 步骤 3：detail 为空 -> 干净
+        if not detail:
+            return self._build_result(
+                method=method,
+                passed=True,
+                reason_code=HostCheckReasonCode.IP_NO_DNS_RECORD,
+                reason="DNS 服务无该 IP 的解析记录",
+                evidence={
+                    "ip": self.ip,
+                    "bk_cloud_id": self.bk_cloud_id,
+                    "rowsNum": 0,
+                },
+            )
+
+        # 步骤 4：detail 非空 -> 有残留
+        records: List[Dict[str, Any]] = []
+        all_domain_names: List[str] = []
+        for item in detail:
+            if not isinstance(item, dict):
+                continue
+            rec = {k: item.get(k) for k in _DNS_RECORD_KEEP_FIELDS if k in item}
+            records.append(rec)
+            dn = item.get("domain_name")
+            if dn:
+                all_domain_names.append(dn)
+
+        rows_num: int = resp.get("rowsNum") if isinstance(resp.get("rowsNum"), int) else len(records)
+        sample_domain: str = all_domain_names[0] if all_domain_names else ""
+
+        # 需求 4.8：passed=False 时日志额外打印完整 domain_name 列表
+        logger.info(
+            "[HostRevokeChecker][{}][{}][check_dns_mapping] matched domains={}".format(
+                self.root_id, self.ip, all_domain_names
+            )
+        )
+
+        return self._build_result(
+            method=method,
+            passed=False,
+            reason_code=HostCheckReasonCode.IP_HAS_DNS_RECORD,
+            reason="该机器 IP 仍有 {} 条 DNS 记录（例：{}），需先清理 DNS".format(rows_num, sample_domain),
+            evidence={
+                "ip": self.ip,
+                "bk_cloud_id": self.bk_cloud_id,
+                "rowsNum": rows_num,
+                "records": records,
+            },
+        )
+
+    # ---------------- 需求 5：DBM 元数据完整性判定 ----------------
+
+    def check_dbm_metadata(self) -> HostCheckResult:
+        """判定机器 DBM 元数据（Machine → Instance → Cluster）是否闭合。
+
+        怎么做（顺序短路）：
+          1) Machine.objects.filter(bk_host_id=...).first() -> 不存在则 NO_MACHINE
+          2) storageinstance_set + proxyinstance_set 至少 1 条 -> 否则 NO_INSTANCE
+          3) 每条实例 port 均非 0 / None -> 否则 INSTANCE_PORT_INVALID
+          4) 每条实例 cluster.all() 均非空 -> 否则 INSTANCE_NO_CLUSTER
+          5) 全通过 -> OK
+
+        :return: :class:`HostCheckResult`
+        边界：
+          - DB 查询异常 -> CHECK_ERROR
+          - 本方法不校验集群入口（ClusterEntry）——入口层由需求 3/4 独立判定
+        """
+        method = "check_dbm_metadata"
+
+        try:
+            # 步骤 1：Machine 存在性
+            machine: Optional[Machine] = Machine.objects.filter(bk_host_id=self.bk_host_id).first()
+            if machine is None:
+                return self._build_result(
+                    method=method,
+                    passed=False,
+                    reason_code=HostCheckReasonCode.NO_MACHINE,
+                    reason="Machine 表不存在 bk_host_id={}".format(self.bk_host_id),
+                    evidence={"bk_host_id": self.bk_host_id},
+                )
+
+            # 步骤 2：Instance 存在性（storage + proxy 合并）
+            storage_instances = list(machine.storageinstance_set.all())
+            proxy_instances = list(machine.proxyinstance_set.all())
+            instances = storage_instances + proxy_instances
+            if not instances:
+                return self._build_result(
+                    method=method,
+                    passed=False,
+                    reason_code=HostCheckReasonCode.NO_INSTANCE,
+                    reason="Machine 存在但无任何 StorageInstance / ProxyInstance 记录",
+                    evidence={"bk_host_id": self.bk_host_id, "machine_id": machine.pk},
+                )
+
+            # 步骤 3：port 合法性
+            invalid_instances: List[Dict[str, Any]] = []
+            for inst in instances:
+                if not inst.port:  # 覆盖 0 / None / ""
+                    invalid_instances.append(
+                        {"id": inst.pk, "ip": getattr(inst, "machine_id", None), "port": inst.port}
+                    )
+            if invalid_instances:
+                return self._build_result(
+                    method=method,
+                    passed=False,
+                    reason_code=HostCheckReasonCode.INSTANCE_PORT_INVALID,
+                    reason="实例端口不合法（共 {} 个），首个：id={}, port={}".format(
+                        len(invalid_instances),
+                        invalid_instances[0]["id"],
+                        invalid_instances[0]["port"],
+                    ),
+                    evidence={"invalid_instances": invalid_instances},
+                )
+
+            # 步骤 4：cluster 绑定
+            instances_without_cluster: List[Dict[str, Any]] = []
+            all_cluster_ids: List[int] = []
+            for inst in instances:
+                cluster_ids = list(inst.cluster.all().values_list("id", flat=True))
+                if not cluster_ids:
+                    instances_without_cluster.append({"id": inst.pk, "port": inst.port, "type": type(inst).__name__})
+                else:
+                    all_cluster_ids.extend(cluster_ids)
+            if instances_without_cluster:
+                return self._build_result(
+                    method=method,
+                    passed=False,
+                    reason_code=HostCheckReasonCode.INSTANCE_NO_CLUSTER,
+                    reason="存在未绑定到集群的实例（共 {} 个），首个：{}".format(
+                        len(instances_without_cluster), instances_without_cluster[0]
+                    ),
+                    evidence={"instances_without_cluster": instances_without_cluster},
+                )
+
+            # 步骤 5：全通过
+            uniq_cluster_ids = sorted(set(all_cluster_ids))
+            return self._build_result(
+                method=method,
+                passed=True,
+                reason_code=HostCheckReasonCode.OK,
+                reason="机器元数据闭合：1 台 Machine、{} 个实例、{} 个集群".format(len(instances), len(uniq_cluster_ids)),
+                evidence={
+                    "machine_exists": True,
+                    "instance_count": len(instances),
+                    "cluster_ids": uniq_cluster_ids,
+                },
+            )
+        except Exception as err:
+            return self._build_result(
+                method=method,
+                passed=False,
+                reason_code=HostCheckReasonCode.CHECK_ERROR,
+                reason="DBM 元数据查询异常：{}".format(err),
+                evidence={
+                    "bk_host_id": self.bk_host_id,
+                    "error": str(err),
+                    "trace": traceback.format_exc(limit=3),
+                },
+            )
+
+    # ---------------- 需求 7：MySQL 主机进程存活检查结果解析 ----------------
+
+    @staticmethod
+    def parse_process_check_result(
+        script_output_json: Dict[str, Any],
+        ip: str,
+    ) -> HostCheckResult:
+        """将 shell 脚本 ``<ctx>`` 中的 JSON 解析为统一的 :class:`HostCheckResult`。
+
+        设计要点 / 怎么做：
+          - **纯函数**：不查 DB、不发 RPC、不写日志（日志由调用方 Service 承担）
+          - **主机维度语义**：只判断整机是否还有 MySQL 家族进程 LISTEN，
+            不再基于端口列表做 alive / missing / hijacked 三态判定
+          - 三分支：check_error > mysql_still_alive > ok
+
+        :param script_output_json: 从脚本 ``<ctx>...</ctx>`` 段提取并 ``json.loads`` 得到的 dict；
+            合法结构包含以下字段：
+              * ``found_mysql_procs`` (bool)  是否命中 MySQL 家族进程
+              * ``hits`` (list[dict])         命中详情，每项含 port/pid/proc_name
+              * ``collect_tool`` (str/null)   实际使用的采集工具（ss / netstat）
+              * ``error`` (str/null)          脚本自身错误信息
+        :param ip: 目标主机 IP，仅用于组装 reason 便于排查
+        :return: :class:`HostCheckResult`，reason_code 取值见 :class:`HostCheckReasonCode`
+        边界：
+          - 入参非 dict -> CHECK_ERROR，evidence.raw_output 携带原始入参
+          - ``script_output_json.error`` 非空 -> CHECK_ERROR（如非 root / 无 ss & netstat）
+          - 缺 ``hits`` 键 / 非 list -> CHECK_ERROR
+          - ``hits`` 数组内元素结构非法（缺 port / pid / proc_name，或 port/pid 非整数）
+            -> CHECK_ERROR
+          - hits 非空 -> MYSQL_STILL_ALIVE（passed=False）
+          - hits 为空 且 error 为空 -> OK（passed=True）
+        """
+        # 步骤 0：入参兜底（本方法是纯函数，即使 script_output_json 为 None 也应给出 CHECK_ERROR）
+        if not isinstance(script_output_json, dict):
+            return HostCheckResult(
+                passed=False,
+                reason_code=HostCheckReasonCode.CHECK_ERROR,
+                reason="[{}] 脚本输出不是合法 dict：type={}".format(ip, type(script_output_json).__name__),
+                evidence={"raw_output": script_output_json},
+            )
+
+        collect_tool = script_output_json.get("collect_tool")
+
+        # 步骤 1：脚本自身报 error（如非 root / ss & netstat 均缺失）
+        script_error = script_output_json.get("error")
+        if script_error:
+            return HostCheckResult(
+                passed=False,
+                reason_code=HostCheckReasonCode.CHECK_ERROR,
+                reason="[{}] 脚本自身报错：{}".format(ip, script_error),
+                evidence={
+                    "raw_output": script_output_json,
+                    "collect_tool": collect_tool,
+                },
+            )
+
+        # 步骤 2：hits 结构合法性
+        hits = script_output_json.get("hits")
+        if not isinstance(hits, list):
+            return HostCheckResult(
+                passed=False,
+                reason_code=HostCheckReasonCode.CHECK_ERROR,
+                reason="[{}] 脚本输出结构异常：缺 hits 键或非 list".format(ip),
+                evidence={"raw_output": script_output_json},
+            )
+
+        # 步骤 3：hits 数组内每一项做结构校验，规整成 List[Dict]
+        normalized_hits: List[Dict[str, Any]] = []
+        for idx, item in enumerate(hits):
+            if not isinstance(item, dict):
+                return HostCheckResult(
+                    passed=False,
+                    reason_code=HostCheckReasonCode.CHECK_ERROR,
+                    reason="[{}] hits[{}] 非 dict：{!r}".format(ip, idx, item),
+                    evidence={"raw_output": script_output_json},
+                )
+            try:
+                port_val: int = int(item["port"])
+                pid_val: int = int(item["pid"])
+            except (KeyError, TypeError, ValueError) as err:
+                return HostCheckResult(
+                    passed=False,
+                    reason_code=HostCheckReasonCode.CHECK_ERROR,
+                    reason="[{}] hits[{}] 缺 port/pid 或非整数：{}".format(ip, idx, err),
+                    evidence={"raw_output": script_output_json},
+                )
+            proc_name = item.get("proc_name")
+            if not isinstance(proc_name, str) or not proc_name:
+                return HostCheckResult(
+                    passed=False,
+                    reason_code=HostCheckReasonCode.CHECK_ERROR,
+                    reason="[{}] hits[{}] 缺 proc_name 或非字符串：{!r}".format(ip, idx, proc_name),
+                    evidence={"raw_output": script_output_json},
+                )
+            normalized_hits.append({"port": port_val, "pid": pid_val, "proc_name": proc_name})
+
+        # 保持稳定顺序：按 port 升序
+        normalized_hits.sort(key=lambda x: (x["port"], x["pid"], x["proc_name"]))
+
+        # 步骤 4：三分支收敛
+        if normalized_hits:
+            hit_pairs = ", ".join(
+                "{p}({n},pid={pid})".format(p=h["port"], n=h["proc_name"], pid=h["pid"]) for h in normalized_hits
+            )
+            return HostCheckResult(
+                passed=False,
+                reason_code=HostCheckReasonCode.MYSQL_STILL_ALIVE,
+                reason=("[{ip}] 主机仍有 {n} 个 MySQL 家族进程 LISTEN：{pairs}").format(
+                    ip=ip, n=len(normalized_hits), pairs=hit_pairs
+                ),
+                evidence={
+                    "collect_tool": collect_tool,
+                    "hits": normalized_hits,
+                },
+            )
+
+        # hits 为空 且 error 为空 -> OK
+        return HostCheckResult(
+            passed=True,
+            reason_code=HostCheckReasonCode.OK,
+            reason="[{ip}] 主机上未检测到 MySQL 家族进程 LISTEN".format(ip=ip),
+            evidence={
+                "collect_tool": collect_tool,
+                "hits": [],
+            },
+        )
