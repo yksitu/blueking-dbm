@@ -55,8 +55,11 @@ class MySQLHostProcessCheckService(ExecuteShellScriptService):
       - ``root_id``            (str, 必填)  bamboo root pipeline id
       - ``node_id``            (str, 必填)  bamboo 节点 id
       - ``node_name``          (str, 必填)  bamboo 节点名，用于 Job 任务命名
-      - ``bk_cloud_id``        (int, 必填)  目标主机云区域 id
-      - ``exec_ip``            (str, 必填)  目标主机 IP（本节点只处理单 IP）
+      - ``bk_cloud_id``        (int, 必填)  目标主机云区域 id（组内所有 IP 共享同一云区域）
+      - ``exec_ip``            (List[str], 必填)  目标主机 IP 列表；**必须是 list**，
+        单机也用 ``["1.1.1.1"]``。组内多机时一次 Job 下发所有 IP，
+        配合 ``write_op=APPEND`` 将每台机器的 <ctx> 汇聚为 ``{ip: <ctx>}`` 结构写入
+        ``trans_data.<write_payload_var>``
       - ``expected_proc_names``(Optional[List[str]])     进程名白名单；不传走默认
 
     额外要求（上层建节点时显式传入，符合父类既有契约）：
@@ -96,10 +99,19 @@ class MySQLHostProcessCheckService(ExecuteShellScriptService):
         node_name: str = kwargs.get("node_name") or self.__class__.__name__
 
         # 1) 必备参数校验（父类 `_execute` 也会读，这里提前校验以给出更明确的日志）
-        exec_ip: Optional[str] = kwargs.get("exec_ip")
-        if not exec_ip:
-            self.log_error(_("[{}] kwargs.exec_ip 缺失").format(node_name))
+        exec_ip: Any = kwargs.get("exec_ip")
+        if not isinstance(exec_ip, list) or not exec_ip:
+            self.log_error(
+                _("[{}] kwargs.exec_ip 必须为非空 list（单机场景也需传 ['1.1.1.1']），实际={}").format(
+                    node_name, type(exec_ip).__name__
+                )
+            )
             return False
+        # 元素类型校验：list 内必须全部是非空 str（父类 splice_exec_ips_list 支持 dict 但本节点收敛为 str）
+        for item in exec_ip:
+            if not isinstance(item, str) or not item:
+                self.log_error(_("[{}] kwargs.exec_ip 列表元素必须为非空 str，实际含 {}").format(node_name, item))
+                return False
 
         # 2) 显式检查 write_payload_var（父类契约：无此变量则拿不到 <ctx> JSON）
         write_payload_var: Optional[str] = data.get_one_of_inputs("write_payload_var")
@@ -130,8 +142,8 @@ class MySQLHostProcessCheckService(ExecuteShellScriptService):
             data.inputs.trans_data = SimpleNamespace()
 
         self.log_info(
-            _("[{node}] 开始下发 MySQL 主机进程存活检查脚本；ip={ip}, write_payload_var={var}").format(
-                node=node_name, ip=exec_ip, var=write_payload_var
+            _("[{node}] 开始下发 MySQL 主机进程存活检查脚本；ips={ips}, write_payload_var={var}").format(
+                node=node_name, ips=exec_ip, var=write_payload_var
             )
         )
 
@@ -142,22 +154,26 @@ class MySQLHostProcessCheckService(ExecuteShellScriptService):
 class MySQLHostProcessCheckComponent(Component):
     """revoke 流程 · MySQL 主机进程存活检查 bamboo 组件。
 
-    上层建节点示例：
+    上层建节点示例（多 IP 场景，APPEND 汇聚为 {ip: <ctx>}）：
       act.component.inputs.kwargs = Var(type=Var.PLAIN, value={
           "root_id": root_id,
           "node_id": node_id,
           "node_name": "MySQL主机进程存活检查",
           "bk_cloud_id": bk_cloud_id,
-          "exec_ip": ip,
+          "exec_ip": ["1.1.1.1", "2.2.2.2"],   # 必须为 list，单机也用 ["1.1.1.1"]
           # 可选：进程名白名单
           "expected_proc_names": ["mysqld", "mysql-proxy", "mariadbd"],
+          # 关键：APPEND 模式将每台机器的 <ctx> 汇聚到 trans_data.<write_payload_var>
+          # 结构为 {ip: <ctx_dict>}；不传则走 REWRITE，多 IP 会互相覆盖
+          "write_op": WriteContextOpType.APPEND.value,
       })
       # 必填：父类契约，指定 <ctx> JSON 写入 trans_data 的属性名
-      act.component.inputs.write_payload_var = Var(type=Var.PLAIN, value="mysql_process_check_ctx")
+      act.component.inputs.write_payload_var = Var(type=Var.PLAIN, value="host_process_check__grp0")
 
     下游节点读取姿势：
-      ctx_json = getattr(trans_data, "mysql_process_check_ctx", None)
-      result = HostRevokeChecker.parse_process_check_result(script_output_json=ctx_json, ip=ip)
+      ctx_dict = getattr(trans_data, "host_process_check__grp0", None) or {}  # {ip: <ctx>}
+      for ip, ctx_json in ctx_dict.items():
+          result = HostRevokeChecker.parse_process_check_result(script_output_json=ctx_json, ip=ip)
     """
 
     name = __name__

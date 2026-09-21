@@ -6,6 +6,19 @@ You may obtain a copy of the License at https://opensource.org/licenses/MIT
 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
 an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
+
+DEPRECATED · TenDBSingle 部署单据主机退回 v1 版本。
+
+现状：
+  - 已被 v2 版本 :class:`MysqlSingleApplyRevokeFlow`
+    （backend/flow/engine/bamboo/scene/mysql/revoke/mysql_single_apply_revoke_flow_v2.py）取代
+  - `MySQLController.mysql_single_apply_scene` 的 `@revoke_with` 装饰器已切到 v2 类
+  - 本类不再被任何入口引用，仅作为回滚安全网保留代码
+
+保留原因：
+  - 生产环境需回滚时，可通过单一 commit 反转 controller 装饰器指向来快速回退
+
+**新场景请勿新增到本文件**。判定 / 清理逻辑请复用 v2 版本的 F1~F4 + 决策矩阵框架。
 """
 from dataclasses import asdict
 from typing import List

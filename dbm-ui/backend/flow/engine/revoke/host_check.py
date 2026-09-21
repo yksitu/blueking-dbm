@@ -11,11 +11,16 @@ specific language governing permissions and limitations under the License.
 主机退回资源池判定公共类。
 
 模块职责：
-  - 提供 revoke 流程复用的 4 个只读判定方法：
+  - 提供 revoke 流程复用的 4 个只读判定方法（v1 · HostCheckResult 风格）：
     1) check_in_ticket_scope    —— 机器是否仍在当前单据管理范围内
     2) check_clb_mapping        —— IP 在 CLB 侧是否仍有注册
     3) check_dns_mapping        —— IP 在 DNS 服务侧是否仍有解析
     4) check_dbm_metadata       —— DBM 元数据（Machine/Instance/Cluster）是否闭合
+  - 提供 revoke_flow v2 F 模型的 4 条判据采集方法（返回 FactCheckOutcome / FactState 三态）：
+    1) check_f1_ownership       —— F1 所有权（MachineEvent 最近事件 ticket 归属）
+    2) check_f2_traffic         —— F2 客户端流量红线（DNS + CLB + proxy 后端引用聚合）
+    3) check_f3_dbm_residue     —— F3 DBM 残留（Machine/ProxyInstance/StorageInstance/Tuple 任一命中）
+    4) check_f4_process         —— F4 进程存活（解析主机进程检查脚本的 ctx JSON）
 
 设计要点：
   - **只读、无副作用**：所有方法不写 DB、不发起变更类 RPC、不写 FlowOutputHandler
@@ -39,13 +44,25 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.components import CCApi
+from backend.components import CCApi, DRSApi
 from backend.components.db_name_service.client import NameServiceApi
 from backend.components.dns.client import DnsApi
 from backend.db_dirty.models import MachineEvent
-from backend.db_meta.models import Machine
+from backend.db_meta.models import Machine, ProxyInstance, StorageInstance, StorageInstanceTuple
 from backend.db_services.cmdb.biz import get_or_create_resource_module
 from backend.flow.engine.revoke.exception import RevokeFlowBaseException
+from backend.flow.engine.revoke.models import (
+    F2_SUB_KEY_CLB,
+    F2_SUB_KEY_DNS,
+    F2_SUB_KEY_PROXY_BACKENDS,
+    F3_EV_KEY_MACHINE,
+    F3_EV_KEY_PROXIES,
+    F3_EV_KEY_STORAGES,
+    F3_EV_KEY_TUPLES,
+    FactCheckOutcome,
+    FactState,
+    RevokeUnit,
+)
 from backend.ticket.models import Ticket
 
 logger = logging.getLogger("flow")
@@ -793,6 +810,493 @@ class HostRevokeChecker:
                     "trace": traceback.format_exc(limit=3),
                 },
             )
+
+    # ==========================================================================
+    # V2 判定框架 · F1~F4 单机判据采集方法
+    # --------------------------------------------------------------------------
+    # 与上方 4 个 check_xxx 方法的区别：
+    #   - check_xxx 系列：面向 revoke_flow v1，返回 HostCheckResult，reason_code 语义偏"是否合规"
+    #   - check_fN_xxx 系列：面向 revoke_flow v2 F 模型，返回 FactCheckOutcome，state 为 YES/NO/UNKNOWN
+    #     三态；F1~F4 组合后由 HostDecisionMatrix 映射为 SKIP/KEEP/MANUAL/RECYCLE 单机结论
+    # 参见需求文档 "组决策判断表 · 表 1" 与 "表 2"。
+    # ==========================================================================
+
+    def check_f1_ownership(self) -> FactCheckOutcome:
+        """F1 · 所有权判据：机器最近一次 MachineEvent 的 ticket 是否等于本单据。
+
+        怎么做：
+          - 查 ``MachineEvent`` 表最近一次事件，`ticket_id == self.ticket.id` → YES
+          - 无事件 或 ticket 不匹配 → NO
+          - DB 查询异常 → UNKNOWN
+          - **不叠加 CC 模块判定**：CC 模块信息仅作 evidence 记录，因为已成功交付的机器
+            CC 模块必然已迁离资源池模块，用它判 F1 会把已投产机器误判为"不属于本单"
+
+        :return: :class:`FactCheckOutcome`
+        边界：
+          - MachineEvent 查询异常 -> state=UNKNOWN，error 携带异常摘要
+          - 无任何事件 -> state=NO（视作"该机器与本单无关联痕迹"）
+          - 最近事件 ticket_id != 本单 -> state=NO
+        """
+        current_ticket_id: int = int(self.ticket.id)
+        try:
+            last_event = MachineEvent.objects.filter(bk_host_id=self.bk_host_id).order_by("-id").first()
+        except Exception as err:
+            logger.warning(
+                "[HostRevokeChecker][{}][{}][check_f1_ownership] MachineEvent query error: {}".format(
+                    self.root_id, self.ip, err
+                )
+            )
+            return FactCheckOutcome(
+                state=FactState.UNKNOWN,
+                evidence={"bk_host_id": self.bk_host_id, "error": str(err)},
+                error=str(err),
+                reason="F1 MachineEvent 查询异常：{}".format(err),
+            )
+
+        if last_event is None:
+            return FactCheckOutcome(
+                state=FactState.NO,
+                evidence={"bk_host_id": self.bk_host_id, "last_event": None},
+                reason="F1=NO：机器无任何 MachineEvent 记录，与本单据无关联痕迹",
+            )
+
+        last_event_ticket_id: Optional[int] = last_event.ticket_id
+        if last_event_ticket_id != current_ticket_id:
+            return FactCheckOutcome(
+                state=FactState.NO,
+                evidence={
+                    "bk_host_id": self.bk_host_id,
+                    "last_event_id": last_event.id,
+                    "last_event_type": last_event.event,
+                    "last_event_ticket_id": last_event_ticket_id,
+                    "current_ticket_id": current_ticket_id,
+                },
+                reason="F1=NO：机器最近一次事件关联单据 {} 与本单 {} 不一致".format(last_event_ticket_id, current_ticket_id),
+            )
+
+        return FactCheckOutcome(
+            state=FactState.YES,
+            evidence={
+                "bk_host_id": self.bk_host_id,
+                "last_event_id": last_event.id,
+                "last_event_type": last_event.event,
+                "last_event_ticket_id": last_event_ticket_id,
+                "current_ticket_id": current_ticket_id,
+            },
+            reason="F1=YES：机器最近事件 ticket={} 与本单 {} 一致".format(last_event_ticket_id, current_ticket_id),
+        )
+
+    def check_f2_traffic(
+        self,
+        unit: RevokeUnit,
+        alive_proxies: Optional[List[Dict[str, Any]]] = None,
+        clb_regions: Optional[List[str]] = None,
+    ) -> FactCheckOutcome:
+        """F2 · 客户端流量红线判据：DNS / CLB / proxy 后端引用 任一命中即 YES（红线保留）。
+
+        怎么做（三个子判据并列跑）：
+          - F2.a · DNS：调 :meth:`check_dns_mapping`；DNS 记录里出现 ``unit.expected_domains``
+            中任一域名 → F2.a=YES；DNS 完全无本机记录 → F2.a=NO；DNS 接口异常 → F2.a=UNKNOWN
+          - F2.b · CLB：调 :meth:`check_clb_mapping`；命中 → F2.b=YES；未命中 → F2.b=NO；
+            未提供 region 视为 NO；CLB 查询异常 → F2.b=UNKNOWN
+          - F2.d · proxy 后端引用（仅 role 以 "backend" 开头的机器）：对每台 alive_proxies 的 admin
+            端口跑 ``SELECT * FROM backends``；返回的 backend 列表包含本机 IP:本单端口 → F2.d=YES；
+            全部 proxy 均未命中 → F2.d=NO；所有 RPC 失败 → F2.d=UNKNOWN
+
+        聚合规则：
+          - 三个子判据任一 YES → F2=YES（红线）
+          - 三个子判据全 NO → F2=NO
+          - 无 YES 但至少一个 UNKNOWN → F2=UNKNOWN
+
+        :param unit: 判定所属机器单元；须包含 expected_domains / expected_ports / role
+        :param alive_proxies: 本组内 F4=YES 的 proxy 描述列表，每项含 keys: ip, admin_port, bk_cloud_id；
+            对 role=backend* 的机器做 F2.d 时使用；None / 空列表 → F2.d 直接判 NO
+        :param clb_regions: CLB 需检查的 region 列表；None / 空 → F2.b 判 NO（不 UNKNOWN）
+        :return: :class:`FactCheckOutcome`；evidence 中携带各子判据的 state 与命中详情
+        边界：
+          - unit 类型不合法 -> 直接返回 UNKNOWN，避免误伤
+          - role="backend_master" / "backend_slave" 均视为 backend 类型，走 F2.d
+          - unit.expected_domains 为空 → F2.a=NO（本机没预期绑域名，无所谓有没有 DNS 残留）
+        """
+        if not isinstance(unit, RevokeUnit):
+            return FactCheckOutcome(
+                state=FactState.UNKNOWN,
+                error="unit is not RevokeUnit",
+                reason="F2 输入 unit 类型非法",
+            )
+
+        # ---- F2.a · DNS ----
+        f2a_state, f2a_ev = self._sub_check_f2a_dns(expected_domains=unit.expected_domains)
+
+        # ---- F2.b · CLB ----
+        f2b_state, f2b_ev = self._sub_check_f2b_clb(regions=clb_regions or [])
+
+        # ---- F2.d · proxy 后端引用（仅 role 以 backend 开头才生效）----
+        role_is_backend: bool = isinstance(unit.role, str) and unit.role.startswith("backend")
+        if role_is_backend:
+            f2d_state, f2d_ev = self._sub_check_f2d_proxy_backends(unit=unit, alive_proxies=alive_proxies or [])
+        else:
+            f2d_state = FactState.NO
+            f2d_ev = {"skipped": True, "reason": "F2.d 仅对 backend 类角色启用"}
+
+        # ---- 聚合 ----
+        evidence: Dict[str, Any] = {
+            F2_SUB_KEY_DNS: {"state": f2a_state.value, **f2a_ev},
+            F2_SUB_KEY_CLB: {"state": f2b_state.value, **f2b_ev},
+            F2_SUB_KEY_PROXY_BACKENDS: {"state": f2d_state.value, **f2d_ev},
+        }
+        sub_states: Tuple[FactState, FactState, FactState] = (f2a_state, f2b_state, f2d_state)
+
+        if FactState.YES in sub_states:
+            hits = [
+                name
+                for name, s in zip((F2_SUB_KEY_DNS, F2_SUB_KEY_CLB, F2_SUB_KEY_PROXY_BACKENDS), sub_states)
+                if s == FactState.YES
+            ]
+            return FactCheckOutcome(
+                state=FactState.YES,
+                evidence=evidence,
+                reason="F2=YES：红线命中，子判据 {} 命中".format(hits),
+            )
+        if FactState.UNKNOWN in sub_states:
+            unknowns = [
+                name
+                for name, s in zip((F2_SUB_KEY_DNS, F2_SUB_KEY_CLB, F2_SUB_KEY_PROXY_BACKENDS), sub_states)
+                if s == FactState.UNKNOWN
+            ]
+            return FactCheckOutcome(
+                state=FactState.UNKNOWN,
+                evidence=evidence,
+                error="unknown sub-facts: {}".format(unknowns),
+                reason="F2=UNKNOWN：无子判据命中 YES，但子判据 {} 无法确认".format(unknowns),
+            )
+        return FactCheckOutcome(
+            state=FactState.NO,
+            evidence=evidence,
+            reason="F2=NO：三个子判据均未命中，无客户端流量残留",
+        )
+
+    def _sub_check_f2a_dns(self, expected_domains: Tuple[str, ...]) -> Tuple[FactState, Dict[str, Any]]:
+        """F2.a · DNS 子判据（内部辅助）。
+
+        怎么做：
+          - 复用 :meth:`check_dns_mapping` 拿到 IP 上所有 DNS 记录
+          - 从 records 中筛选出 ``expected_domains`` 命中项；命中即 YES
+          - 若 DNS 完全无本机记录 → NO；接口异常 → UNKNOWN
+
+        :param expected_domains: 本单在本机预期绑定的域名列表
+        :return: (state, evidence)；evidence 携带命中的域名列表与全部 dns 响应摘要
+        边界：
+          - expected_domains 为空 → 直接 NO（本机不该绑域名，无关注价值）
+        """
+        if not expected_domains:
+            return FactState.NO, {"skipped": True, "reason": "本机无预期域名，F2.a 不适用"}
+
+        r = self.check_dns_mapping()
+        # r.reason_code == CHECK_ERROR -> UNKNOWN
+        if r.reason_code == HostCheckReasonCode.CHECK_ERROR:
+            return FactState.UNKNOWN, {"error": r.reason, "evidence": r.evidence}
+        # r.reason_code == IP_NO_DNS_RECORD -> NO
+        if r.reason_code == HostCheckReasonCode.IP_NO_DNS_RECORD:
+            return FactState.NO, {"dns_records": []}
+        # 有 DNS 记录：判断是否命中 expected_domains
+        expected_set = set(expected_domains)
+        records: List[Dict[str, Any]] = r.evidence.get("records", []) if isinstance(r.evidence, dict) else []
+        matched: List[Dict[str, Any]] = [rec for rec in records if rec.get("domain_name") in expected_set]
+        if matched:
+            return FactState.YES, {"matched_records": matched, "expected_domains": list(expected_domains)}
+        # 有别的域名但没命中本单预期 → 视作 NO（可能是别的单据的历史残留，不在本单红线范围）
+        return FactState.NO, {
+            "dns_records": records,
+            "expected_domains": list(expected_domains),
+            "matched_records": [],
+        }
+
+    def _sub_check_f2b_clb(self, regions: List[str]) -> Tuple[FactState, Dict[str, Any]]:
+        """F2.b · CLB 子判据（内部辅助）。
+
+        怎么做：
+          - 复用 :meth:`check_clb_mapping` 判定本机 IP 是否在 CLB 后端
+          - regions 空 → 直接 NO（不启用 CLB 检查）
+          - CLB 命中 → YES；未命中 → NO；接口异常 → UNKNOWN
+
+        :param regions: CLB 需检查的 region 列表
+        :return: (state, evidence)
+        边界：
+          - regions 空视为 NO 而非 UNKNOWN（HA 场景通常不启用 CLB，避免误挂起）
+        """
+        if not regions:
+            return FactState.NO, {"skipped": True, "reason": "未配置 CLB regions，F2.b 不启用"}
+
+        r = self.check_clb_mapping(regions=regions)
+        if r.reason_code == HostCheckReasonCode.CHECK_ERROR:
+            return FactState.UNKNOWN, {"error": r.reason, "evidence": r.evidence}
+        if r.reason_code == HostCheckReasonCode.IP_REGISTERED_IN_CLB:
+            return FactState.YES, {"matched": r.evidence}
+        # NO_REGION_INPUT / IP_NOT_REGISTERED_IN_CLB → NO
+        return FactState.NO, {"evidence": r.evidence}
+
+    def _sub_check_f2d_proxy_backends(
+        self, unit: RevokeUnit, alive_proxies: List[Dict[str, Any]]
+    ) -> Tuple[FactState, Dict[str, Any]]:
+        """F2.d · proxy 后端引用子判据（内部辅助，仅 role=backend* 的机器调用）。
+
+        怎么做：
+          - 对每台 alive_proxies 的 admin 端口跑 ``DRSApi.proxyrpc SELECT * FROM backends``
+          - 解析 backends 列表；命中 ``本机 IP:本单端口`` 任一组合 → YES
+          - 全部 proxy 均未命中 → NO
+          - 所有 RPC 均失败 → UNKNOWN
+
+        :param unit: 判定所属机器（backend 类角色）
+        :param alive_proxies: 本组内 F4=YES 的 proxy 描述列表，每项 keys: ip, admin_port, bk_cloud_id
+        :return: (state, evidence)
+        边界：
+          - alive_proxies 为空 → NO（无 F4 存活的 proxy 无法查后端，视作"无 proxy 引用"）
+          - proxy 返回 error_msg -> 该 proxy 记入 failed_proxies，继续查其他
+          - 部分 proxy 成功但均未命中 且 有 failed → NO（成功的 proxy 都没引用则视作 NO）
+        """
+        if not alive_proxies:
+            return FactState.NO, {"skipped": True, "reason": "无 F4 存活的 proxy，F2.d 视作 NO"}
+
+        expected_ports: List[int] = list(unit.expected_ports)
+        # 构造 "ip:port" 匹配集合
+        expected_targets: set = {"{}:{}".format(unit.ip, p) for p in expected_ports}
+
+        matched_hits: List[Dict[str, Any]] = []
+        failed_proxies: List[Dict[str, Any]] = []
+        queried_proxies: List[str] = []
+
+        # 按 bk_cloud_id 分组批量发 RPC（DRSApi.proxyrpc 支持一次多个 address 但要求同 cloud_id）
+        cloud_groups: Dict[int, List[str]] = {}
+        for p in alive_proxies:
+            proxy_addr = "{}:{}".format(p.get("ip"), p.get("admin_port"))
+            cloud_id = int(p.get("bk_cloud_id", self.bk_cloud_id))
+            cloud_groups.setdefault(cloud_id, []).append(proxy_addr)
+            queried_proxies.append(proxy_addr)
+
+        for cloud_id, addresses in cloud_groups.items():
+            try:
+                resp = DRSApi.proxyrpc(
+                    {
+                        "addresses": addresses,
+                        "cmds": ["SELECT * FROM backends;"],
+                        "force": False,
+                        "bk_cloud_id": cloud_id,
+                    }
+                )
+            except Exception as err:
+                logger.warning(
+                    "[HostRevokeChecker][{}][{}][check_f2_traffic.f2d] proxyrpc failed for cloud_id={} addresses={}: {}".format(
+                        self.root_id, self.ip, cloud_id, addresses, err
+                    )
+                )
+                for a in addresses:
+                    failed_proxies.append({"address": a, "error": str(err)})
+                continue
+
+            if not isinstance(resp, list):
+                for a in addresses:
+                    failed_proxies.append({"address": a, "error": "resp not list"})
+                continue
+
+            for item in resp:
+                if not isinstance(item, dict):
+                    continue
+                addr = item.get("address", "")
+                err_msg = item.get("error_msg") or ""
+                if err_msg:
+                    failed_proxies.append({"address": addr, "error": err_msg})
+                    continue
+                # 解析 cmd_results 里的 backends 表
+                cmd_results = item.get("cmd_results") or []
+                for cr in cmd_results:
+                    if not isinstance(cr, dict):
+                        continue
+                    for row in cr.get("table_data") or []:
+                        if not isinstance(row, dict):
+                            continue
+                        # backends 表通常字段名为 address；容错读一下 "backend"
+                        backend_addr = str(row.get("address") or row.get("backend") or "").strip()
+                        if backend_addr in expected_targets:
+                            matched_hits.append(
+                                {
+                                    "proxy_address": addr,
+                                    "backend_address": backend_addr,
+                                }
+                            )
+
+        if matched_hits:
+            return FactState.YES, {
+                "matched_hits": matched_hits,
+                "queried_proxies": queried_proxies,
+                "failed_proxies": failed_proxies,
+            }
+        # 无命中但全部 RPC 都失败 → UNKNOWN
+        if failed_proxies and len(failed_proxies) >= len(queried_proxies):
+            return FactState.UNKNOWN, {
+                "failed_proxies": failed_proxies,
+                "queried_proxies": queried_proxies,
+                "error": "all proxy RPCs failed",
+            }
+        # 部分成功但均未命中 → NO
+        return FactState.NO, {
+            "queried_proxies": queried_proxies,
+            "failed_proxies": failed_proxies,
+            "expected_targets": sorted(expected_targets),
+        }
+
+    def check_f3_dbm_residue(self, unit: Optional[RevokeUnit] = None) -> FactCheckOutcome:
+        """F3 · DBM 元数据残留判据：Machine / ProxyInstance / StorageInstance / StorageInstanceTuple 任一命中即 YES。
+
+        怎么做：
+          - 查 :class:`Machine` 表本机记录；命中 → F3.d 存在
+          - 查 :class:`ProxyInstance` / :class:`StorageInstance` 表本机 bk_host_id 相关记录；
+            若提供 unit.expected_ports，仅统计端口在预期内的实例；否则统计全部
+          - 查 :class:`StorageInstanceTuple` 表本机相关的主从关系记录
+          - 任一有记录 → F3=YES，evidence 按需求文档 表 5 的键名分组记录命中的对象 ID / port
+
+        :param unit: 判定所属机器单元；unit.expected_ports 用于精确过滤 instance；None 时统计整机
+        :return: :class:`FactCheckOutcome`
+        边界：
+          - DB 查询异常 -> state=UNKNOWN，error 携带异常摘要
+          - 全部四表均无本机相关记录 -> state=NO
+        """
+        expected_ports: Tuple[int, ...] = unit.expected_ports if unit is not None else tuple()
+        try:
+            # ---- F3.d · Machine ----
+            machine = Machine.objects.filter(bk_host_id=self.bk_host_id).first()
+            machine_hit: Optional[Dict[str, Any]] = None
+            if machine is not None:
+                machine_hit = {
+                    "bk_host_id": machine.bk_host_id,
+                    "ip": machine.ip,
+                    "machine_type": machine.machine_type,
+                    "cluster_type": machine.cluster_type,
+                }
+
+            # ---- F3.a · ProxyInstance ----
+            proxy_qs = ProxyInstance.objects.filter(machine__bk_host_id=self.bk_host_id)
+            if expected_ports:
+                proxy_qs = proxy_qs.filter(port__in=list(expected_ports))
+            proxy_hits: List[Dict[str, Any]] = [{"id": p.pk, "port": p.port, "status": p.status} for p in proxy_qs]
+
+            # ---- F3.a · StorageInstance ----
+            storage_qs = StorageInstance.objects.filter(machine__bk_host_id=self.bk_host_id)
+            if expected_ports:
+                storage_qs = storage_qs.filter(port__in=list(expected_ports))
+            storage_hits: List[Dict[str, Any]] = [
+                {"id": s.pk, "port": s.port, "instance_role": s.instance_role, "status": s.status} for s in storage_qs
+            ]
+
+            # ---- F3.c · StorageInstanceTuple ----
+            # 本机作为主(ejector) 或 作为从(receiver) 都算命中；
+            # 分两次查再合并，避免引入额外的 Q import
+            ejector_tuples = list(
+                StorageInstanceTuple.objects.filter(ejector__machine__bk_host_id=self.bk_host_id).values_list(
+                    "id", "ejector_id", "receiver_id"
+                )
+            )
+            receiver_tuples = list(
+                StorageInstanceTuple.objects.filter(receiver__machine__bk_host_id=self.bk_host_id).values_list(
+                    "id", "ejector_id", "receiver_id"
+                )
+            )
+            all_tuple_ids: set = set()
+            tuple_hits: List[Dict[str, Any]] = []
+            for tid, ej_id, rc_id in ejector_tuples + receiver_tuples:
+                if tid in all_tuple_ids:
+                    continue
+                all_tuple_ids.add(tid)
+                tuple_hits.append({"id": tid, "ejector_id": ej_id, "receiver_id": rc_id})
+
+        except Exception as err:
+            logger.warning(
+                "[HostRevokeChecker][{}][{}][check_f3_dbm_residue] DB query error: {}".format(
+                    self.root_id, self.ip, err
+                )
+            )
+            return FactCheckOutcome(
+                state=FactState.UNKNOWN,
+                evidence={"bk_host_id": self.bk_host_id, "error": str(err)},
+                error=str(err),
+                reason="F3 元数据查询异常：{}".format(err),
+            )
+
+        evidence: Dict[str, Any] = {
+            F3_EV_KEY_MACHINE: machine_hit,
+            F3_EV_KEY_PROXIES: proxy_hits,
+            F3_EV_KEY_STORAGES: storage_hits,
+            F3_EV_KEY_TUPLES: tuple_hits,
+        }
+        if machine_hit is None and not proxy_hits and not storage_hits and not tuple_hits:
+            return FactCheckOutcome(
+                state=FactState.NO,
+                evidence=evidence,
+                reason="F3=NO：DBM 元数据无本机相关记录",
+            )
+        return FactCheckOutcome(
+            state=FactState.YES,
+            evidence=evidence,
+            reason="F3=YES：DBM 元数据有残留（Machine={} Proxy={} Storage={} Tuple={}）".format(
+                bool(machine_hit), len(proxy_hits), len(storage_hits), len(tuple_hits)
+            ),
+        )
+
+    @staticmethod
+    def check_f4_process(process_check_ctx_json: Optional[Dict[str, Any]], ip: str) -> FactCheckOutcome:
+        """F4 · 进程存活判据：解析上游 :class:`MySQLHostProcessCheckComponent` 输出的 ``<ctx>`` JSON。
+
+        怎么做：
+          - 复用现有 :meth:`parse_process_check_result` 的规范化逻辑
+          - 映射规则：
+            * parse 结果 passed=True + reason_code=OK → F4=NO（无 MySQL 家族进程 LISTEN）
+            * parse 结果 passed=False + reason_code=MYSQL_STILL_ALIVE → F4=YES（有进程）
+            * parse 结果 passed=False + reason_code=CHECK_ERROR → F4=UNKNOWN（脚本自身报错/结构异常）
+
+        :param process_check_ctx_json: 上游 bamboo 节点写入 trans_data 的 <ctx> JSON dict；
+            None 时表示上游节点未执行 / 失败，视为 UNKNOWN
+        :param ip: 目标主机 IP，用于日志与 evidence
+        :return: :class:`FactCheckOutcome`
+        边界：
+          - process_check_ctx_json 为 None -> state=UNKNOWN，error="ctx_json is None"
+          - 其他解析异常收敛为 UNKNOWN
+        """
+        if process_check_ctx_json is None:
+            return FactCheckOutcome(
+                state=FactState.UNKNOWN,
+                evidence={"ip": ip, "error": "ctx_json is None"},
+                error="ctx_json is None",
+                reason="F4=UNKNOWN：上游进程检查节点未产出 ctx JSON",
+            )
+
+        r = HostRevokeChecker.parse_process_check_result(script_output_json=process_check_ctx_json, ip=ip)
+        if r.reason_code == HostCheckReasonCode.OK:
+            return FactCheckOutcome(
+                state=FactState.NO,
+                evidence={
+                    "ip": ip,
+                    "hits": r.evidence.get("hits", []),
+                    "collect_tool": r.evidence.get("collect_tool"),
+                },
+                reason="F4=NO：主机无 MySQL 家族进程 LISTEN",
+            )
+        if r.reason_code == HostCheckReasonCode.MYSQL_STILL_ALIVE:
+            return FactCheckOutcome(
+                state=FactState.YES,
+                evidence={
+                    "ip": ip,
+                    "hits": r.evidence.get("hits", []),
+                    "collect_tool": r.evidence.get("collect_tool"),
+                },
+                reason="F4=YES：主机仍有 {} 个 MySQL 家族进程 LISTEN".format(len(r.evidence.get("hits", []))),
+            )
+        # CHECK_ERROR 或其他兜底 → UNKNOWN
+        return FactCheckOutcome(
+            state=FactState.UNKNOWN,
+            evidence={"ip": ip, "parse_evidence": r.evidence},
+            error=r.reason,
+            reason="F4=UNKNOWN：{}".format(r.reason),
+        )
 
     # ---------------- 需求 7：MySQL 主机进程存活检查结果解析 ----------------
 

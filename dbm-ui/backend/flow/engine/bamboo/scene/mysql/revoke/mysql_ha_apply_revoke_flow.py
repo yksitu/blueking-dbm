@@ -6,6 +6,18 @@ You may obtain a copy of the License at https://opensource.org/licenses/MIT
 Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
 an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
+
+DEPRECATED · v1 · MySQLHAApplyRevokeFlow
+
+本文件已于「一组资源绑定」F 模型 revoke 重构（详见需求文档
+`.codebuddy/plan/mysql_apply_revoke/requirements.md`）后从
+`mysql_ha_apply_scene` 的 `@revoke_with` 入口解绑，仅保留代码以便必要时快速回滚。
+
+- 新入口：`backend/flow/engine/bamboo/scene/mysql/revoke/mysql_ha_apply_revoke_flow_v2.py`
+- 回滚方式：将 `backend/flow/engine/controller/mysql.py` 顶部 import 恢复为
+  `from backend.flow.engine.bamboo.scene.mysql.revoke.mysql_ha_apply_revoke_flow import MySQLHAApplyRevokeFlow`
+  并把 `@revoke_with` 装饰器改回 `MySQLHAApplyRevokeFlow` 即可。
+- 请勿再基于本文件二次开发；有改动请在 v2 上继续。
 """
 from dataclasses import asdict
 from typing import Dict, List
