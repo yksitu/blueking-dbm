@@ -123,10 +123,18 @@ class MysqlHaApplyRevokeFlow(RevokeFlowBase):
         )
 
         # ---- 2. 顶层 pipeline 并行编排每组的合并子流程 ----
+        # 关键字段说明：
+        #   - ``uid``：bamboo 框架契约字段，写入 FlowTree.uid / FlowNode.uid；数值 = ticket_id
+        #   - ``ticket_type`` / ``created_by`` / ``bk_biz_id``：Builder.run_pipeline 写 FlowTree 时强依赖，
+        #     必须从 self.data（即 revoke_flow 入参的 ticket_data）透传；否则 KeyError。
+        #   - ``db_type`` / ``os_type``：供清理 Service（如 ClearMachineScript）用；不进 FlowTree。
+        #   - ticket_id 不放 global_data：本 flow 内业务 Service 通过 build_group_revoke_subflow(ticket_id=)
+        #     显式入参 + act.kwargs 传递，无需走 global_data；避免与 uid 冗余（数值等价）。
         global_data: Dict[str, Any] = {
             "uid": ticket_id,
-            "ticket_id": ticket_id,
             "bk_biz_id": bk_biz_id,
+            "ticket_type": self.data["ticket_type"],
+            "created_by": self.data.get("created_by") or self.data.get("operator") or "",
             "db_type": DBType.MySQL.value,
             "os_type": BkOsTypeCode.LINUX.value,
         }
@@ -175,8 +183,10 @@ class MysqlHaApplyRevokeFlow(RevokeFlowBase):
 
         global_data: Dict[str, Any] = {
             "uid": int(self.data.get("uid") or 0),
-            "ticket_id": int(self.data.get("uid") or 0),
             "bk_biz_id": int(self.data.get("bk_biz_id") or 0),
+            # FlowTree 强依赖字段：从 ticket_data 透传，否则 Builder.run_pipeline 会 KeyError
+            "ticket_type": self.data["ticket_type"],
+            "created_by": self.data.get("created_by") or self.data.get("operator") or "",
         }
         top_pipeline = Builder(root_id=self.root_id, data=global_data)
         top_pipeline.add_act(
