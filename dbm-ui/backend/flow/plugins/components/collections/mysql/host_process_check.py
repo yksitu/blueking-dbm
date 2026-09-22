@@ -102,7 +102,7 @@ class MySQLHostProcessCheckService(ExecuteShellScriptService):
         exec_ip: Any = kwargs.get("exec_ip")
         if not isinstance(exec_ip, list) or not exec_ip:
             self.log_error(
-                _("[{}] kwargs.exec_ip 必须为非空 list（单机场景也需传 ['1.1.1.1']），实际={}").format(
+                _("[{}] kwargs.exec_ip 必须为非空 list（单机场景也需传 ['x.x.x.x']），实际={}").format(
                     node_name, type(exec_ip).__name__
                 )
             )

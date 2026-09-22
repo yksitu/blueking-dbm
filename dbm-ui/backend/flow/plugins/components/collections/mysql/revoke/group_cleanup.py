@@ -47,6 +47,7 @@ from backend.db_meta.enums import ClusterType
 from backend.db_meta.models import Cluster, StorageInstanceTuple
 from backend.flow.consts import DBA_ROOT_USER
 from backend.flow.engine.bamboo.scene.common.machine_os_init import RecycleOutputContext
+from backend.flow.engine.revoke.log_utils import group_decision_zh
 from backend.flow.plugins.components.collections.common.base_service import BaseService
 from backend.flow.plugins.components.collections.common.exec_clear_machine import ClearMachineScriptService
 from backend.flow.utils.base.flow_output import FlowOutputHandler
@@ -121,7 +122,11 @@ class ResourceGroupCleanupService(BaseService):
 
         if decision != _GROUP_RECYCLE_VALUE:
             self.log_info(
-                _("[{}] ips=[{}] decision={}，非 GROUP_RECYCLE，跳过清理（no-op）").format(node_name, ips_display, decision)
+                _("本组决策={decision_zh}（{decision}），非可清理场景，跳过清理 · IP: {ips}").format(
+                    decision_zh=group_decision_zh(decision),
+                    decision=decision.upper() if decision else "UNKNOWN",
+                    ips=ips_display,
+                )
             )
             if trans_data is not None:
                 setattr(trans_data, "pending_clear_ips", [])
@@ -136,7 +141,7 @@ class ResourceGroupCleanupService(BaseService):
             return True
 
         self.log_info(
-            _("[{}] 开始清理 ips=[{}] 单机数={} clusters={}").format(node_name, ips_display, len(verdicts), cluster_domains)
+            _("开始清理本组 · 单机数={n} 集群数={c} · IP: {ips}").format(n=len(verdicts), c=len(cluster_domains), ips=ips_display)
         )
 
         cleaned_hosts: List[Dict[str, Any]] = []
@@ -176,7 +181,9 @@ class ResourceGroupCleanupService(BaseService):
 
         except Exception as err:
             self.log_error(
-                _("[{}] 清理动作失败 ips=[{}] err={}，本组改判 GROUP_MANUAL，机器不进 FlowSummary").format(node_name, ips_display, err)
+                _("清理动作失败：{err} · 本组改判为整组挂起（GROUP_MANUAL），机器不进 FlowSummary · IP: {ips}").format(
+                    err=err, ips=ips_display
+                )
             )
             logger.exception(err)
             # 改判组决策（静态字段：SubProcess 隔离保证组间无冲突）
@@ -207,15 +214,13 @@ class ResourceGroupCleanupService(BaseService):
                 # insert_data 失败不阻塞主流程：机器已成功清理，只是"退回资源池摘要表"追加失败
                 # 记 ERROR 供人工兜底；组决策不改判
                 self.log_error(
-                    _("[{}] 追加 ToResourceSerializer 失败 ips=[{}] err={}；机器清理已完成，需人工确认摘要表").format(
-                        node_name, ips_display, err
-                    )
+                    _("追加 ToResourceSerializer 失败：{err}；机器清理已完成，需人工确认摘要表 · IP: {ips}").format(err=err, ips=ips_display)
                 )
                 logger.exception(err)
 
         self.log_info(
-            _("[{}] 清理完成 ips=[{}] 已清理机器数={} 待下发脚本机器数={}").format(
-                node_name, ips_display, len(cleaned_hosts), len(pending_clear_ips)
+            _("清理完成 · 已清理机器数={cleaned} 待下发脚本机器数={pending} · IP: {ips}").format(
+                cleaned=len(cleaned_hosts), pending=len(pending_clear_ips), ips=ips_display
             )
         )
         return True
@@ -437,6 +442,12 @@ class ResourceGroupMachineClearService(ClearMachineScriptService):
         pending_ips = getattr(trans_data, "pending_clear_ips", None) if trans_data is not None else None
         if not pending_ips:
             self.log_info(_("[{}] trans_data.pending_clear_ips 为空，跳过机器脚本清理（no-op）").format(node_name))
+            # 关键契约：父类 BkJobService._schedule 会读 ``data.outputs.ext_result``；
+            # 若不写值则默认 None，父类 L403 ``ext_result["result"]`` 会抛
+            # ``TypeError: 'NoneType' object is not subscriptable``。
+            # 写为 bool 会让父类 ``isinstance(ext_result, bool)`` 分支命中：
+            # 视作同步组件，自动 finish_schedule() 并透传本 return 值，不再轮询 Job 状态。
+            data.outputs.ext_result = True
             return True
 
         # 回填 kwargs 字段：exec_ips + account_alias

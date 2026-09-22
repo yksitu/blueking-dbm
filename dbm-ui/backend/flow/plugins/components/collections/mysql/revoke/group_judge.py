@@ -65,7 +65,12 @@ from pipeline.component_framework.component import Component
 from backend.flow.engine.revoke.decision import GroupDecisionMatrix, HostDecisionMatrix
 from backend.flow.engine.revoke.group_check import ResourceGroupChecker, build_group_warning_log
 from backend.flow.engine.revoke.host_check import HostRevokeChecker
-from backend.flow.engine.revoke.log_utils import format_group_ips
+from backend.flow.engine.revoke.log_utils import (
+    extract_decision_reason,
+    format_group_ips,
+    group_decision_zh,
+    host_decision_zh,
+)
 from backend.flow.engine.revoke.models import (
     FactState,
     GroupDecision,
@@ -178,11 +183,8 @@ class ResourceGroupJudgeService(BaseService):
         root_id: str = kwargs.get("root_id") or "unknown-root"
         # 日志主标识：与 act_name / cleanup Service 保持一致的 IP 列表字符串
         ips_display: str = format_group_ips(group)
-        self.log_info(
-            _("[{}] 开始组级判定 ips=[{}] units={} ticket_id={} group_id={}").format(
-                node_name, ips_display, len(group.units), ticket_id, group.group_id
-            )
-        )
+        # ── 入口日志：不嵌入 IP 列表（避免前端在逗号处断行），IP 信息已在 act_name 里
+        self.log_info(_("开始判定本组 {n} 台主机（单据 {ticket_id}）").format(n=len(group.units), ticket_id=ticket_id))
 
         # ---- 2. 读取上游进程检查节点写入的组级 <ctx> dict ----
         trans_data = data.get_one_of_inputs("trans_data")
@@ -202,15 +204,11 @@ class ResourceGroupJudgeService(BaseService):
         ctx_by_ip: Dict[str, Any] = {u.ip: ctx_dict_all.get(u.ip) for u in group.units}
 
         # ---- 3. 先对每台机器采集 F4（供 F2.d 决定 alive_proxies）----
+        # 本步为内部子判据采集，不单独打每台日志；F4 结果会在第 5 步"单机结论"日志中一并展示
         f4_map: Dict[str, "FactState"] = {}
         for u in group.units:
             f4_outcome = HostRevokeChecker.check_f4_process(ctx_by_ip.get(u.ip), ip=u.ip)
             f4_map[u.ip] = f4_outcome.state
-            self.log_info(
-                _("[{}] F4 采集 ip={} bk_host_id={} state={} reason={}").format(
-                    node_name, u.ip, u.bk_host_id, f4_outcome.state.value, f4_outcome.reason
-                )
-            )
 
         # ---- 4. 收集本组"F4=YES 的 proxy 列表"供 F2.d 使用 ----
         alive_proxies: List[Dict[str, Any]] = _collect_alive_proxy_descriptors(group, f4_map)
@@ -232,20 +230,23 @@ class ResourceGroupJudgeService(BaseService):
             # 复用第 3 步产出的 F4 outcome，重新构造一次避免重复解析
             f4 = HostRevokeChecker.check_f4_process(ctx_by_ip.get(u.ip), ip=u.ip)
             facts = HostRevokeFacts(f1_ownership=f1, f2_traffic=f2, f3_dbm_residue=f3, f4_process=f4)
-            self.log_info(
-                _("[{}] F 判据 ip={} F1={} F2={} F3={} F4={}").format(
-                    node_name,
-                    u.ip,
-                    f1.state.value,
-                    f2.state.value,
-                    f3.state.value,
-                    f4.state.value,
-                )
-            )
             verdict = HostDecisionMatrix.classify(unit=u, facts=facts)
+            # ── 单机结论日志：F 判据 + 决策 + 业务原因，合成一行，避免两条重复刷屏
             self.log_info(
-                _("[{}] 单机结论 ip={} decision={} reason={}").format(
-                    node_name, u.ip, verdict.decision.value, verdict.reason
+                _(
+                    "主机 {ip}（bk_host_id={host_id}, 角色={role}）· 判定={decision_zh}（{decision}）"
+                    " · 原因：{reason} · F1={f1} F2={f2} F3={f3} F4={f4}"
+                ).format(
+                    ip=u.ip,
+                    host_id=u.bk_host_id,
+                    role=u.role,
+                    decision_zh=host_decision_zh(verdict.decision.value),
+                    decision=verdict.decision.value.upper(),
+                    reason=extract_decision_reason(verdict.reason),
+                    f1=f1.state.value.upper(),
+                    f2=f2.state.value.upper(),
+                    f3=f3.state.value.upper(),
+                    f4=f4.state.value.upper(),
                 )
             )
             verdicts.append(verdict)
@@ -259,9 +260,14 @@ class ResourceGroupJudgeService(BaseService):
 
         # ---- 7. 组决策 ----
         gv: GroupVerdict = GroupDecisionMatrix.classify(group=group, verdicts=verdicts_tuple, g1=g1, g2=g2)
+        # ── 组结论日志：中文为主、代号括号补充；IP 列表放最末，避免逗号断行影响主结论可读
         self.log_info(
-            _("[{}] 组结论 ips=[{}] decision={} reason={} group_id={}").format(
-                node_name, ips_display, gv.decision.value, gv.reason, group.group_id
+            _("本组结论：{decision_zh}（{decision}） · {reason} · IP: {ips} · group_id={group_id}").format(
+                decision_zh=group_decision_zh(gv.decision.value),
+                decision=gv.decision.value.upper(),
+                reason=extract_decision_reason(gv.reason),
+                ips=ips_display,
+                group_id=group.group_id,
             )
         )
         # 组挂起时输出结构化 WARNING 日志（供告警平台捕获）

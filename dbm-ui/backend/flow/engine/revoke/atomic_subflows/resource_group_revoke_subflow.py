@@ -106,7 +106,7 @@ def build_group_revoke_subflow(
     exec_ips: List[str] = [u.ip for u in group.units]
     bk_cloud_id: int = int(group.units[0].bk_cloud_id)
 
-    # 生成节点名 / 日志共用的 IP 列表字符串（>=4 台自动折叠为 ip1,ip2,ip3,...(+N)）
+    # 生成节点名 / 日志共用的 IP 列表字符串（全量展示，`, ` 分隔，不折叠）
     ips_display: str = format_group_ips(group)
 
     # ---- 段 1：单 act 多 IP 下发进程扫描（APPEND 模式汇聚为 {ip: <ctx>}）----
