@@ -11,16 +11,15 @@ specific language governing permissions and limitations under the License.
 主机退回资源池判定公共类。
 
 模块职责：
-  - 提供 revoke 流程复用的 4 个只读判定方法（v1 · HostCheckResult 风格）：
-    1) check_in_ticket_scope    —— 机器是否仍在当前单据管理范围内
-    2) check_clb_mapping        —— IP 在 CLB 侧是否仍有注册
-    3) check_dns_mapping        —— IP 在 DNS 服务侧是否仍有解析
-    4) check_dbm_metadata       —— DBM 元数据（Machine/Instance/Cluster）是否闭合
-  - 提供 revoke_flow v2 F 模型的 4 条判据采集方法（返回 FactCheckOutcome / FactState 三态）：
+  - 提供 F1~F4 单机判据采集方法（返回 FactCheckOutcome / FactState 三态）：
     1) check_f1_ownership       —— F1 所有权（MachineEvent 最近事件 ticket 归属）
-    2) check_f2_traffic         —— F2 客户端流量红线（DNS + CLB + proxy 后端引用聚合）
+    2) check_f2_traffic         —— F2 客户端流量红线（DNS + CLB 聚合）
     3) check_f3_dbm_residue     —— F3 DBM 残留（Machine/ProxyInstance/StorageInstance/Tuple 任一命中）
     4) check_f4_process         —— F4 进程存活（解析主机进程检查脚本的 ctx JSON）
+  - 提供两个可复用的外部真相探针（被 F2 子判据内部消费；亦可被联调脚本单独调用）：
+    * check_clb_mapping         —— IP 在 CLB 侧是否仍有后端注册（外部真相）
+    * check_dns_mapping         —— IP 在 DNS 服务侧是否仍有解析记录（外部真相）
+  - 提供进程检查脚本输出解析器：parse_process_check_result
 
 设计要点：
   - **只读、无副作用**：所有方法不写 DB、不发起变更类 RPC、不写 FlowOutputHandler
@@ -48,13 +47,14 @@ from backend.components import CCApi, DRSApi
 from backend.components.db_name_service.client import NameServiceApi
 from backend.components.dns.client import DnsApi
 from backend.db_dirty.models import MachineEvent
+from backend.db_meta.enums import ClusterType, ClusterTypeMachineTypeDefine
 from backend.db_meta.models import Machine, ProxyInstance, StorageInstance, StorageInstanceTuple
+from backend.db_meta.models.cluster_monitor import ClusterMonitorTopo
 from backend.db_services.cmdb.biz import get_or_create_resource_module
 from backend.flow.engine.revoke.exception import RevokeFlowBaseException
 from backend.flow.engine.revoke.models import (
     F2_SUB_KEY_CLB,
     F2_SUB_KEY_DNS,
-    F2_SUB_KEY_PROXY_BACKENDS,
     F3_EV_KEY_MACHINE,
     F3_EV_KEY_PROXIES,
     F3_EV_KEY_STORAGES,
@@ -78,15 +78,6 @@ class HostCheckReasonCode:
     #: 判定通过
     OK: str = "ok"
 
-    #: 需求 2：无任何主机事件记录
-    NO_MACHINE_EVENT: str = "no_machine_event"
-    #: 需求 2：最近一次事件关联单据与当前单据不一致
-    TICKET_MISMATCH: str = "ticket_mismatch"
-    #: 需求 2：CC 侧查不到该主机
-    CC_HOST_NOT_FOUND: str = "cc_host_not_found"
-    #: 需求 2：CC 侧模块与资源池模块不一致
-    MODULE_MISMATCH: str = "module_mismatch"
-
     #: 需求 3：未提供 region，无法判定 CLB 注册状态
     NO_REGION_INPUT: str = "no_region_input"
     #: 需求 3：IP 已注册在 CLB 上
@@ -98,15 +89,6 @@ class HostCheckReasonCode:
     IP_HAS_DNS_RECORD: str = "ip_has_dns_record"
     #: 需求 4：IP 无 DNS 记录
     IP_NO_DNS_RECORD: str = "ip_no_dns_record"
-
-    #: 需求 5：Machine 表不存在
-    NO_MACHINE: str = "no_machine"
-    #: 需求 5：Machine 存在但无任何 Instance 记录
-    NO_INSTANCE: str = "no_instance"
-    #: 需求 5：任一 Instance 的 port 为 0 / None
-    INSTANCE_PORT_INVALID: str = "instance_port_invalid"
-    #: 需求 5：任一 Instance 未绑定到任何 Cluster
-    INSTANCE_NO_CLUSTER: str = "instance_no_cluster"
 
     #: 需求 7（MySQL 主机进程存活检查）：主机上仍有 MySQL 家族进程 LISTEN
     #: （方案已收敛为"主机维度"扫描：只要命中白名单中任一 comm 即视为存活，
@@ -182,13 +164,17 @@ class HostRevokeChecker:
             ip="1.2.3.4",
             bk_host_id=123456,
         )
-        r1 = checker.check_in_ticket_scope()
-        r2 = checker.check_clb_mapping(regions=["南京"])
-        r3 = checker.check_dns_mapping()
-        r4 = checker.check_dbm_metadata()
+        # F 判据（3 态，供 revoke 决策矩阵消费）
+        f1 = checker.check_f1_ownership()
+        f2 = checker.check_f2_traffic(unit=unit, alive_proxies=..., clb_regions=[...])
+        f3 = checker.check_f3_dbm_residue(unit=unit)
+        f4 = HostRevokeChecker.check_f4_process(process_check_ctx_json=..., ip="1.2.3.4")
+        # 外部真相探针（可单独调用，被 F2 子判据内部复用）
+        r_clb = checker.check_clb_mapping(regions=["南京"])
+        r_dns = checker.check_dns_mapping()
 
-    线程安全：**非线程安全**（进程内幂等缓存字典为可变状态），
-      单个 revoke flow 内串行使用即可；如需并发，请为每个线程各起一个实例。
+    线程安全：**非线程安全**（进程内可变状态），单个 revoke flow 内串行使用即可；
+      如需并发，请为每个线程各起一个实例。
 
     边界：
       - 构造入参任一为空或类型不合法 -> 抛 :class:`RevokeFlowBaseException`
@@ -235,12 +221,6 @@ class HostRevokeChecker:
         self.bk_cloud_id: int = bk_cloud_id
         self.ip: str = ip
         self.bk_host_id: int = bk_host_id
-
-        # 进程内幂等缓存：避免同一实例内对同一 key 重复查询外部服务
-        # key 结构参见各方法内注释
-        self._cc_cache: Dict[int, Optional[Dict[str, Any]]] = {}
-        self._clb_cache: Dict[Tuple[str, str], Any] = {}
-        self._dns_cache: Dict[Tuple[str, int], Any] = {}
 
     # ---------------- 私有工具 ----------------
 
@@ -320,140 +300,9 @@ class HostRevokeChecker:
         self._log_result(method=method, result=result)
         return result
 
-    # ---------------- 需求 2：管理范围判定 ----------------
-
-    def check_in_ticket_scope(self, use_cache: bool = False) -> HostCheckResult:
-        """判定机器是否仍在当前单据的管理范围内。
-
-        怎么做（顺序短路）：
-          1) 查 ``MachineEvent`` 最近一次事件，无记录 -> NO_MACHINE_EVENT
-          2) 最近事件 ticket_id != 当前单据 id -> TICKET_MISMATCH
-          3) 调 CCApi 查 bk_module_id，无记录 -> CC_HOST_NOT_FOUND
-          4) bk_module_id != 资源池模块 id -> MODULE_MISMATCH
-          5) 全通过 -> OK
-
-        :param use_cache: 是否对同一 bk_host_id 的 CC 查询结果做进程内缓存，默认 False
-        :return: :class:`HostCheckResult`，reason_code 见 :class:`HostCheckReasonCode`
-        边界：
-          - CC 接口异常 -> CHECK_ERROR，evidence.error 携带异常摘要，不向上抛
-          - DB 查询异常 -> CHECK_ERROR
-        """
-        method = "check_in_ticket_scope"
-        current_ticket_id: int = int(self.ticket.id)
-
-        # 步骤 1：查 MachineEvent 最近一次事件
-        try:
-            last_event = MachineEvent.objects.filter(bk_host_id=self.bk_host_id).order_by("-id").first()
-        except Exception as err:
-            return self._build_result(
-                method=method,
-                passed=False,
-                reason_code=HostCheckReasonCode.CHECK_ERROR,
-                reason="MachineEvent 查询异常：{}".format(err),
-                evidence={"bk_host_id": self.bk_host_id, "error": str(err)},
-            )
-
-        if last_event is None:
-            return self._build_result(
-                method=method,
-                passed=False,
-                reason_code=HostCheckReasonCode.NO_MACHINE_EVENT,
-                reason="机器无任何主机事件记录，无法确认归属（bk_host_id={}）".format(self.bk_host_id),
-                evidence={"bk_host_id": self.bk_host_id},
-            )
-
-        # 步骤 2：ticket_id 一致性
-        last_event_ticket_id: Optional[int] = last_event.ticket_id
-        if last_event_ticket_id != current_ticket_id:
-            return self._build_result(
-                method=method,
-                passed=False,
-                reason_code=HostCheckReasonCode.TICKET_MISMATCH,
-                reason="该机器最近一次事件关联单据是 {}，与当前单据 {} 不一致".format(last_event_ticket_id, current_ticket_id),
-                evidence={
-                    "last_event_id": last_event.id,
-                    "last_event_type": last_event.event,
-                    "last_event_ticket_id": last_event_ticket_id,
-                    "current_ticket_id": current_ticket_id,
-                },
-            )
-
-        # 步骤 3：查 CC find_host_biz_relations
-        cc_records: List[Dict[str, Any]]
-        try:
-            if use_cache and self.bk_host_id in self._cc_cache:
-                cc_records = self._cc_cache[self.bk_host_id] or []
-            else:
-                cc_records = CCApi.find_host_biz_relations({"bk_host_id": [self.bk_host_id]}) or []
-                if use_cache:
-                    self._cc_cache[self.bk_host_id] = cc_records
-        except Exception as err:
-            return self._build_result(
-                method=method,
-                passed=False,
-                reason_code=HostCheckReasonCode.CHECK_ERROR,
-                reason="CC 接口调用异常：{}".format(err),
-                evidence={
-                    "bk_host_id": self.bk_host_id,
-                    "error": str(err),
-                    "trace": traceback.format_exc(limit=3),
-                },
-            )
-
-        if not cc_records:
-            return self._build_result(
-                method=method,
-                passed=False,
-                reason_code=HostCheckReasonCode.CC_HOST_NOT_FOUND,
-                reason="CC 查询不到该主机（bk_host_id={}）".format(self.bk_host_id),
-                evidence={"bk_host_id": self.bk_host_id},
-            )
-
-        # 步骤 4：bk_module_id 与资源池模块一致性（严格版：任一记录不匹配即视为脱离）
-        try:
-            resource_bk_module_id: int = int(get_or_create_resource_module())
-        except Exception as err:
-            return self._build_result(
-                method=method,
-                passed=False,
-                reason_code=HostCheckReasonCode.CHECK_ERROR,
-                reason="获取资源池模块 id 失败：{}".format(err),
-                evidence={"error": str(err)},
-            )
-
-        actual_bk_module_ids: List[int] = [int(rec.get("bk_module_id") or 0) for rec in cc_records]
-        mismatched = [mid for mid in actual_bk_module_ids if mid != resource_bk_module_id]
-        if mismatched:
-            return self._build_result(
-                method=method,
-                passed=False,
-                reason_code=HostCheckReasonCode.MODULE_MISMATCH,
-                reason="该机器当前 CC 模块 {} 与资源池模块 {} 不一致".format(mismatched, resource_bk_module_id),
-                evidence={
-                    "actual_bk_module_id": actual_bk_module_ids,
-                    "resource_bk_module_id": resource_bk_module_id,
-                },
-            )
-
-        # 步骤 5：全通过
-        return self._build_result(
-            method=method,
-            passed=True,
-            reason_code=HostCheckReasonCode.OK,
-            reason=("机器仍在本单据管理范围内：最近事件 ticket_id={}，CC 模块={}，与资源池模块={} 一致").format(
-                current_ticket_id, actual_bk_module_ids, resource_bk_module_id
-            ),
-            evidence={
-                "last_event_ticket_id": last_event_ticket_id,
-                "current_ticket_id": current_ticket_id,
-                "bk_module_id": actual_bk_module_ids,
-                "resource_bk_module_id": resource_bk_module_id,
-            },
-        )
-
     # ---------------- 需求 3：CLB 映射判定 ----------------
 
-    def check_clb_mapping(self, regions: List[str], use_cache: bool = False) -> HostCheckResult:
+    def check_clb_mapping(self, regions: List[str]) -> HostCheckResult:
         """判定 IP 是否已注册在 CLB 后端上（完全不查 DBM 元数据）。
 
         怎么做：
@@ -465,7 +314,6 @@ class HostRevokeChecker:
           6) 否则 -> IP_NOT_REGISTERED_IN_CLB
 
         :param regions: 需要检查的 region 列表；由调用方决定 region 来源
-        :param use_cache: 是否对 (ip, region) 命中缓存，默认 False
         :return: :class:`HostCheckResult`
         边界：
           - regions 内空字符串会被过滤；若全部为空视为 NO_REGION_INPUT
@@ -499,14 +347,8 @@ class HostRevokeChecker:
 
         # 步骤 2：遍历 region
         for region in valid_regions:
-            cache_key: Tuple[str, str] = (self.ip, region)
             try:
-                if use_cache and cache_key in self._clb_cache:
-                    resp = self._clb_cache[cache_key]
-                else:
-                    resp = NameServiceApi.clb_check_clb_register_target_by_ip({"region": region, "ips": [self.ip]})
-                    if use_cache:
-                        self._clb_cache[cache_key] = resp
+                resp = NameServiceApi.clb_check_clb_register_target_by_ip({"region": region, "ips": [self.ip]})
             except Exception as err:
                 failed_regions[region] = str(err)
                 logger.warning(
@@ -515,8 +357,6 @@ class HostRevokeChecker:
                     )
                 )
                 continue
-
-            all_responses[region] = resp
 
             # 步骤 3：解析 clbinfos
             clbinfos: List[Dict[str, Any]] = []
@@ -584,7 +424,7 @@ class HostRevokeChecker:
 
     # ---------------- 需求 4：DNS 映射判定 ----------------
 
-    def check_dns_mapping(self, use_cache: bool = False) -> HostCheckResult:
+    def check_dns_mapping(self) -> HostCheckResult:
         """判定 IP 在 DNS 服务侧是否仍有域名解析（完全不查 DBM 元数据）。
 
         怎么做：
@@ -593,23 +433,16 @@ class HostRevokeChecker:
           3) detail 为空 -> IP_NO_DNS_RECORD
           4) detail 非空 -> IP_HAS_DNS_RECORD，records 仅保留定位字段
 
-        :param use_cache: 是否对 (ip, bk_cloud_id) 命中缓存，默认 False
         :return: :class:`HostCheckResult`
         边界：
           - DnsApi 异常 -> CHECK_ERROR（保守策略，视为不干净）
           - passed=False 分支会在日志中打印完整 domain_name 列表
         """
         method = "check_dns_mapping"
-        cache_key: Tuple[str, int] = (self.ip, self.bk_cloud_id)
 
         # 步骤 1：调用 DNS 接口
         try:
-            if use_cache and cache_key in self._dns_cache:
-                resp = self._dns_cache[cache_key]
-            else:
-                resp = DnsApi.get_domain({"ip": self.ip, "bk_cloud_id": self.bk_cloud_id})
-                if use_cache:
-                    self._dns_cache[cache_key] = resp
+            resp = DnsApi.get_domain({"ip": self.ip, "bk_cloud_id": self.bk_cloud_id})
         except Exception as err:
             return self._build_result(
                 method=method,
@@ -701,143 +534,53 @@ class HostRevokeChecker:
             },
         )
 
-    # ---------------- 需求 5：DBM 元数据完整性判定 ----------------
+    # ---------------- F1~F4 单机判据采集 ----------------
 
-    def check_dbm_metadata(self) -> HostCheckResult:
-        """判定机器 DBM 元数据（Machine → Instance → Cluster）是否闭合。
+    def check_f1_ownership(self, unit: RevokeUnit) -> FactCheckOutcome:
+        """F1 · 所有权判据：机器归属本单据 且 处于本 (bk_biz_id + db_type) 管控范围。
 
-        怎么做（顺序短路）：
-          1) Machine.objects.filter(bk_host_id=...).first() -> 不存在则 NO_MACHINE
-          2) storageinstance_set + proxyinstance_set 至少 1 条 -> 否则 NO_INSTANCE
-          3) 每条实例 port 均非 0 / None -> 否则 INSTANCE_PORT_INVALID
-          4) 每条实例 cluster.all() 均非空 -> 否则 INSTANCE_NO_CLUSTER
-          5) 全通过 -> OK
+        判定分两段串行（任一段判 NO 即短路返回，段 1 优先）：
 
-        :return: :class:`HostCheckResult`
-        边界：
-          - DB 查询异常 -> CHECK_ERROR
-          - 本方法不校验集群入口（ClusterEntry）——入口层由需求 3/4 独立判定
-        """
-        method = "check_dbm_metadata"
+        段 1 · 属于本单据管控：
+          - 从 ``self.ticket.details["parent_ticket"]`` 取 apply 原单据 id
+            （RECYCLE_APPLY_HOST 的 details 由 :meth:`Ticket.create_recycle_ticket` 写入，
+             parent_ticket = 真正申请这批机器的原 apply 单据 id）
+          - 缺失 / 非法 → 直接抛 :class:`RevokeFlowBaseException` 短路给上层（契约违反）
+          - 查 ``MachineEvent`` 表最近一次事件，``ticket_id == parent_ticket_id`` → 段 1 通过
+          - 无事件 或 ticket 不匹配 → **F1=NO**（机器与本单无关联痕迹）
 
-        try:
-            # 步骤 1：Machine 存在性
-            machine: Optional[Machine] = Machine.objects.filter(bk_host_id=self.bk_host_id).first()
-            if machine is None:
-                return self._build_result(
-                    method=method,
-                    passed=False,
-                    reason_code=HostCheckReasonCode.NO_MACHINE,
-                    reason="Machine 表不存在 bk_host_id={}".format(self.bk_host_id),
-                    evidence={"bk_host_id": self.bk_host_id},
-                )
+        段 2 · 属于本 (bk_biz_id + db_type) 管控范围（双通道任一命中即通过）：
+          - 调 CCApi 查该 bk_host_id 的 bk_module_id 列表
+          - 通道 A · 资源池模块：命中 :func:`get_or_create_resource_module` 的模块 id
+              → 机器"还没交付"或"已归还到资源池"，视为本单管控内
+          - 通道 B · DBM 集群模块：命中 :class:`ClusterMonitorTopo` 表中
+              ``bk_biz_id == self.bk_biz_id`` 且
+              ``machine_type ∈ ClusterTypeMachineTypeDefine[unit.cluster_type]`` 的模块
+              → 机器"已交付到本 db_type 的集群模块下"，视为本单管控内
+          - 通道 A / 通道 B 均不命中 → **F1=NO**（视为非法移动到其他业务 / 其他 db_type）
 
-            # 步骤 2：Instance 存在性（storage + proxy 合并）
-            storage_instances = list(machine.storageinstance_set.all())
-            proxy_instances = list(machine.proxyinstance_set.all())
-            instances = storage_instances + proxy_instances
-            if not instances:
-                return self._build_result(
-                    method=method,
-                    passed=False,
-                    reason_code=HostCheckReasonCode.NO_INSTANCE,
-                    reason="Machine 存在但无任何 StorageInstance / ProxyInstance 记录",
-                    evidence={"bk_host_id": self.bk_host_id, "machine_id": machine.pk},
-                )
-
-            # 步骤 3：port 合法性
-            invalid_instances: List[Dict[str, Any]] = []
-            for inst in instances:
-                if not inst.port:  # 覆盖 0 / None / ""
-                    invalid_instances.append(
-                        {"id": inst.pk, "ip": getattr(inst, "machine_id", None), "port": inst.port}
-                    )
-            if invalid_instances:
-                return self._build_result(
-                    method=method,
-                    passed=False,
-                    reason_code=HostCheckReasonCode.INSTANCE_PORT_INVALID,
-                    reason="实例端口不合法（共 {} 个），首个：id={}, port={}".format(
-                        len(invalid_instances),
-                        invalid_instances[0]["id"],
-                        invalid_instances[0]["port"],
-                    ),
-                    evidence={"invalid_instances": invalid_instances},
-                )
-
-            # 步骤 4：cluster 绑定
-            instances_without_cluster: List[Dict[str, Any]] = []
-            all_cluster_ids: List[int] = []
-            for inst in instances:
-                cluster_ids = list(inst.cluster.all().values_list("id", flat=True))
-                if not cluster_ids:
-                    instances_without_cluster.append({"id": inst.pk, "port": inst.port, "type": type(inst).__name__})
-                else:
-                    all_cluster_ids.extend(cluster_ids)
-            if instances_without_cluster:
-                return self._build_result(
-                    method=method,
-                    passed=False,
-                    reason_code=HostCheckReasonCode.INSTANCE_NO_CLUSTER,
-                    reason="存在未绑定到集群的实例（共 {} 个），首个：{}".format(
-                        len(instances_without_cluster), instances_without_cluster[0]
-                    ),
-                    evidence={"instances_without_cluster": instances_without_cluster},
-                )
-
-            # 步骤 5：全通过
-            uniq_cluster_ids = sorted(set(all_cluster_ids))
-            return self._build_result(
-                method=method,
-                passed=True,
-                reason_code=HostCheckReasonCode.OK,
-                reason="机器元数据闭合：1 台 Machine、{} 个实例、{} 个集群".format(len(instances), len(uniq_cluster_ids)),
-                evidence={
-                    "machine_exists": True,
-                    "instance_count": len(instances),
-                    "cluster_ids": uniq_cluster_ids,
-                },
-            )
-        except Exception as err:
-            return self._build_result(
-                method=method,
-                passed=False,
-                reason_code=HostCheckReasonCode.CHECK_ERROR,
-                reason="DBM 元数据查询异常：{}".format(err),
-                evidence={
-                    "bk_host_id": self.bk_host_id,
-                    "error": str(err),
-                    "trace": traceback.format_exc(limit=3),
-                },
-            )
-
-    # ==========================================================================
-    # V2 判定框架 · F1~F4 单机判据采集方法
-    # --------------------------------------------------------------------------
-    # 与上方 4 个 check_xxx 方法的区别：
-    #   - check_xxx 系列：面向 revoke_flow v1，返回 HostCheckResult，reason_code 语义偏"是否合规"
-    #   - check_fN_xxx 系列：面向 revoke_flow v2 F 模型，返回 FactCheckOutcome，state 为 YES/NO/UNKNOWN
-    #     三态；F1~F4 组合后由 HostDecisionMatrix 映射为 SKIP/KEEP/MANUAL/RECYCLE 单机结论
-    # 参见需求文档 "组决策判断表 · 表 1" 与 "表 2"。
-    # ==========================================================================
-
-    def check_f1_ownership(self) -> FactCheckOutcome:
-        """F1 · 所有权判据：机器最近一次 MachineEvent 的 ticket 是否等于本单据。
-
-        怎么做：
-          - 查 ``MachineEvent`` 表最近一次事件，`ticket_id == self.ticket.id` → YES
-          - 无事件 或 ticket 不匹配 → NO
-          - DB 查询异常 → UNKNOWN
-          - **不叠加 CC 模块判定**：CC 模块信息仅作 evidence 记录，因为已成功交付的机器
-            CC 模块必然已迁离资源池模块，用它判 F1 会把已投产机器误判为"不属于本单"
-
+        :param unit: 判定所属 RevokeUnit；用 ``unit.cluster_type`` 反查 db_type
+            对应的 machine_type 白名单，用于收紧 ClusterMonitorTopo 查询
         :return: :class:`FactCheckOutcome`
+        :raises RevokeFlowBaseException: parent_ticket 缺失或非法（契约违反 · 短路上抛）
         边界：
-          - MachineEvent 查询异常 -> state=UNKNOWN，error 携带异常摘要
-          - 无任何事件 -> state=NO（视作"该机器与本单无关联痕迹"）
-          - 最近事件 ticket_id != 本单 -> state=NO
+          - MachineEvent DB 查询异常 → state=UNKNOWN
+          - CC 接口异常 → state=UNKNOWN（外部服务保守降级，避免误清理）
+          - 资源池模块获取失败 → state=UNKNOWN
+          - ClusterMonitorTopo DB 查询异常 → state=UNKNOWN
+          - CC 查询不到该主机（cc_records=[]） → state=NO（视作已从 CC 撤销）
+          - unit.cluster_type 非法 → state=UNKNOWN
         """
-        current_ticket_id: int = int(self.ticket.id)
+        if not isinstance(unit, RevokeUnit):
+            return FactCheckOutcome(
+                state=FactState.UNKNOWN,
+                error="unit is not RevokeUnit",
+                reason="F1 输入 unit 类型非法",
+            )
+
+        # ==================== 段 1：属于本单据管控 ====================
+        parent_ticket_id: int = self._extract_parent_ticket_id()
+
         try:
             last_event = MachineEvent.objects.filter(bk_host_id=self.bk_host_id).order_by("-id").first()
         except Exception as err:
@@ -848,7 +591,7 @@ class HostRevokeChecker:
             )
             return FactCheckOutcome(
                 state=FactState.UNKNOWN,
-                evidence={"bk_host_id": self.bk_host_id, "error": str(err)},
+                evidence={"bk_host_id": self.bk_host_id, "parent_ticket_id": parent_ticket_id, "error": str(err)},
                 error=str(err),
                 reason="F1 MachineEvent 查询异常：{}".format(err),
             )
@@ -856,66 +599,261 @@ class HostRevokeChecker:
         if last_event is None:
             return FactCheckOutcome(
                 state=FactState.NO,
-                evidence={"bk_host_id": self.bk_host_id, "last_event": None},
+                evidence={
+                    "bk_host_id": self.bk_host_id,
+                    "parent_ticket_id": parent_ticket_id,
+                    "last_event": None,
+                },
                 reason="F1=NO：机器无任何 MachineEvent 记录，与本单据无关联痕迹",
             )
 
         last_event_ticket_id: Optional[int] = last_event.ticket_id
-        if last_event_ticket_id != current_ticket_id:
+        if last_event_ticket_id != parent_ticket_id:
             return FactCheckOutcome(
                 state=FactState.NO,
                 evidence={
                     "bk_host_id": self.bk_host_id,
+                    "parent_ticket_id": parent_ticket_id,
                     "last_event_id": last_event.id,
                     "last_event_type": last_event.event,
                     "last_event_ticket_id": last_event_ticket_id,
-                    "current_ticket_id": current_ticket_id,
                 },
-                reason="F1=NO：机器最近一次事件关联单据 {} 与本单 {} 不一致".format(last_event_ticket_id, current_ticket_id),
+                reason="F1=NO：机器最近一次事件关联单据 {} 与本单 apply parent_ticket {} 不一致".format(
+                    last_event_ticket_id, parent_ticket_id
+                ),
+            )
+
+        # ==================== 段 2：属于本 (bk_biz_id + db_type) 管控 ====================
+        # 段 1 通过后段 2 的 evidence 基线，避免每个 return 分支都重写一遍
+        f1_evidence_base: Dict[str, Any] = {
+            "bk_host_id": self.bk_host_id,
+            "parent_ticket_id": parent_ticket_id,
+            "last_event_id": last_event.id,
+            "last_event_type": last_event.event,
+            "last_event_ticket_id": last_event_ticket_id,
+        }
+
+        # 2.1 反查本单 cluster_type 对应的 machine_type 白名单（等价"限定 db_type"）
+        try:
+            cluster_type_enum = ClusterType(unit.cluster_type)
+            allowed_machine_types: List[str] = [mt.value for mt in ClusterTypeMachineTypeDefine[cluster_type_enum]]
+        except (ValueError, KeyError) as err:
+            logger.warning(
+                "[HostRevokeChecker][{}][{}][check_f1_ownership] invalid cluster_type={!r}: {}".format(
+                    self.root_id, self.ip, unit.cluster_type, err
+                )
+            )
+            return FactCheckOutcome(
+                state=FactState.UNKNOWN,
+                evidence={**f1_evidence_base, "cluster_type": unit.cluster_type, "error": str(err)},
+                error=str(err),
+                reason="F1 unit.cluster_type={!r} 非法或未在 ClusterTypeMachineTypeDefine 中定义".format(unit.cluster_type),
+            )
+
+        # 2.2 CC 查询该主机的 bk_module_id 列表
+        try:
+            cc_records: List[Dict[str, Any]] = CCApi.find_host_biz_relations({"bk_host_id": [self.bk_host_id]}) or []
+        except Exception as err:
+            logger.warning(
+                "[HostRevokeChecker][{}][{}][check_f1_ownership] CC find_host_biz_relations error: {}".format(
+                    self.root_id, self.ip, err
+                )
+            )
+            return FactCheckOutcome(
+                state=FactState.UNKNOWN,
+                evidence={**f1_evidence_base, "error": str(err), "trace": traceback.format_exc(limit=3)},
+                error=str(err),
+                reason="F1 CC 接口调用异常：{}".format(err),
+            )
+
+        if not cc_records:
+            return FactCheckOutcome(
+                state=FactState.NO,
+                evidence={**f1_evidence_base, "cc_bk_module_ids": []},
+                reason="F1=NO：CC 查询不到该主机（bk_host_id={}）".format(self.bk_host_id),
+            )
+
+        actual_bk_module_ids: List[int] = sorted(
+            {int(rec.get("bk_module_id") or 0) for rec in cc_records if rec.get("bk_module_id")}
+        )
+        if not actual_bk_module_ids:
+            return FactCheckOutcome(
+                state=FactState.NO,
+                evidence={**f1_evidence_base, "cc_records_count": len(cc_records), "cc_bk_module_ids": []},
+                reason="F1=NO：CC 返回的 host_biz_relations 中未包含有效 bk_module_id",
+            )
+
+        # 2.3 通道 A · 是否属于资源池模块
+        try:
+            resource_bk_module_id: int = int(get_or_create_resource_module())
+        except Exception as err:
+            logger.warning(
+                "[HostRevokeChecker][{}][{}][check_f1_ownership] get_or_create_resource_module error: {}".format(
+                    self.root_id, self.ip, err
+                )
+            )
+            return FactCheckOutcome(
+                state=FactState.UNKNOWN,
+                evidence={**f1_evidence_base, "cc_bk_module_ids": actual_bk_module_ids, "error": str(err)},
+                error=str(err),
+                reason="F1 获取资源池模块 id 失败：{}".format(err),
+            )
+
+        # 2.4 通道 B · 是否属于本 (bk_biz_id + db_type) 的 ClusterMonitorTopo 模块
+        # ClusterMonitorTopo 无 db_type 字段，用 machine_type__in 白名单等价过滤
+        try:
+            dbm_matched_module_ids: List[int] = sorted(
+                set(
+                    ClusterMonitorTopo.objects.filter(
+                        bk_biz_id=self.bk_biz_id,
+                        machine_type__in=allowed_machine_types,
+                        bk_module_id__in=actual_bk_module_ids,
+                    )
+                    .values_list("bk_module_id", flat=True)
+                    .distinct()
+                )
+            )
+        except Exception as err:
+            logger.warning(
+                "[HostRevokeChecker][{}][{}][check_f1_ownership] ClusterMonitorTopo query error: {}".format(
+                    self.root_id, self.ip, err
+                )
+            )
+            return FactCheckOutcome(
+                state=FactState.UNKNOWN,
+                evidence={
+                    **f1_evidence_base,
+                    "cc_bk_module_ids": actual_bk_module_ids,
+                    "resource_bk_module_id": resource_bk_module_id,
+                    "error": str(err),
+                    "trace": traceback.format_exc(limit=3),
+                },
+                error=str(err),
+                reason="F1 ClusterMonitorTopo 查询异常：{}".format(err),
+            )
+
+        hit_cluster_module: bool = bool(dbm_matched_module_ids)
+
+        # 2.5 汇总判定（严格版 · 判定 A ∨ 判定 B）
+        # 判定 A · 资源池独占：CC 只有一个模块，且等于资源池模块 id
+        #   → 机器"从未交付"或"已完全归还资源池"，视为本单管控内
+        # 判定 B · DBM 集群子集：CC 每一个模块都在本 (bk_biz_id + db_type) 的 ClusterMonitorTopo 集群模块池内
+        #   → 机器"已完整交付到本 db_type 集群模块下"，视为本单管控内
+        # 其他一律 F1=NO（混合状态 / 越界 / 非法移动）
+        hit_resource_only: bool = len(actual_bk_module_ids) == 1 and actual_bk_module_ids[0] == resource_bk_module_id
+        hit_full_dbm_subset: bool = hit_cluster_module and set(actual_bk_module_ids).issubset(
+            set(dbm_matched_module_ids)
+        )
+
+        f1_evidence_full: Dict[str, Any] = {
+            **f1_evidence_base,
+            "cc_bk_module_ids": actual_bk_module_ids,
+            "resource_bk_module_id": resource_bk_module_id,
+            "dbm_matched_module_ids": dbm_matched_module_ids,
+            "cluster_type": unit.cluster_type,
+            "allowed_machine_types": allowed_machine_types,
+            "hit_resource_only": hit_resource_only,
+            "hit_full_dbm_subset": hit_full_dbm_subset,
+        }
+
+        if hit_resource_only:
+            return FactCheckOutcome(
+                state=FactState.YES,
+                evidence=f1_evidence_full,
+                reason=("F1=YES：机器最近事件 ticket={} 与本单 apply parent_ticket={} 一致，" "且 CC 模块唯一且等于资源池模块 {}（未交付）").format(
+                    last_event_ticket_id, parent_ticket_id, resource_bk_module_id
+                ),
+            )
+
+        if hit_full_dbm_subset:
+            return FactCheckOutcome(
+                state=FactState.YES,
+                evidence=f1_evidence_full,
+                reason=(
+                    "F1=YES：机器最近事件 ticket={} 与本单 apply parent_ticket={} 一致，"
+                    "且 CC 模块 {} 全部落在本业务 db_type={} 的 DBM 集群模块池内"
+                ).format(last_event_ticket_id, parent_ticket_id, actual_bk_module_ids, unit.cluster_type),
             )
 
         return FactCheckOutcome(
-            state=FactState.YES,
-            evidence={
-                "bk_host_id": self.bk_host_id,
-                "last_event_id": last_event.id,
-                "last_event_type": last_event.event,
-                "last_event_ticket_id": last_event_ticket_id,
-                "current_ticket_id": current_ticket_id,
-            },
-            reason="F1=YES：机器最近事件 ticket={} 与本单 {} 一致".format(last_event_ticket_id, current_ticket_id),
+            state=FactState.NO,
+            evidence=f1_evidence_full,
+            reason=(
+                "F1=NO：机器 CC 模块 {cc_modules} 既非独占资源池模块 {resource}，"
+                "也未完全落在本业务 {biz} 的 db_type={ctype} 集群模块内（命中子集 {matched}），"
+                "疑似非法移动或状态异常"
+            ).format(
+                cc_modules=actual_bk_module_ids,
+                resource=resource_bk_module_id,
+                biz=self.bk_biz_id,
+                ctype=unit.cluster_type,
+                matched=dbm_matched_module_ids,
+            ),
         )
+
+    def _extract_parent_ticket_id(self) -> int:
+        """从 self.ticket.details 提取 parent_ticket（apply 原单据 id）。
+
+        RECYCLE_APPLY_HOST 单据由 :meth:`Ticket.create_recycle_ticket` 创建，
+        其 details 中的 ``parent_ticket`` 字段记录了发起主机回收的原 apply 单据 id。
+        F1 判据必须用 parent_ticket 与 MachineEvent 记录的 ticket_id 比对，
+        而不能用 RECYCLE 单据自身的 id（那是新单据、与 MachineEvent 永远不匹配）。
+
+        :return: apply 原单据 id
+        :raises RevokeFlowBaseException: details 非 dict / parent_ticket 缺失 / 非合法整数
+            —— 契约违反场景，短路上抛让 pipeline FAILED，避免"F1 静默 NO 全部 SKIP"的假象
+        """
+        details = getattr(self.ticket, "details", None)
+        if not isinstance(details, dict):
+            raise RevokeFlowBaseException(
+                "F1: ticket.details is not a dict (ticket_id={}, details_type={})".format(
+                    self.ticket.id, type(details).__name__
+                )
+            )
+
+        raw = details.get("parent_ticket")
+        if raw is None:
+            raise RevokeFlowBaseException(
+                "F1: ticket.details['parent_ticket'] is missing (ticket_id={})".format(self.ticket.id)
+            )
+
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as err:
+            raise RevokeFlowBaseException(
+                "F1: ticket.details['parent_ticket'] is not int-castable, got {!r} (ticket_id={}): {}".format(
+                    raw, self.ticket.id, err
+                )
+            )
 
     def check_f2_traffic(
         self,
         unit: RevokeUnit,
-        alive_proxies: Optional[List[Dict[str, Any]]] = None,
         clb_regions: Optional[List[str]] = None,
     ) -> FactCheckOutcome:
-        """F2 · 客户端流量红线判据：DNS / CLB / proxy 后端引用 任一命中即 YES（红线保留）。
+        """F2 · 客户端流量红线判据：DNS / CLB 任一命中即 YES（红线保留）。
 
-        怎么做（三个子判据并列跑）：
+        怎么做（两个子判据并列跑）：
           - F2.a · DNS：调 :meth:`check_dns_mapping`；DNS 记录里出现 ``unit.expected_domains``
             中任一域名 → F2.a=YES；DNS 完全无本机记录 → F2.a=NO；DNS 接口异常 → F2.a=UNKNOWN
           - F2.b · CLB：调 :meth:`check_clb_mapping`；命中 → F2.b=YES；未命中 → F2.b=NO；
             未提供 region 视为 NO；CLB 查询异常 → F2.b=UNKNOWN
-          - F2.d · proxy 后端引用（仅 role 以 "backend" 开头的机器）：对每台 alive_proxies 的 admin
-            端口跑 ``SELECT * FROM backends``；返回的 backend 列表包含本机 IP:本单端口 → F2.d=YES；
-            全部 proxy 均未命中 → F2.d=NO；所有 RPC 失败 → F2.d=UNKNOWN
 
         聚合规则：
-          - 三个子判据任一 YES → F2=YES（红线）
-          - 三个子判据全 NO → F2=NO
+          - 两个子判据任一 YES → F2=YES（红线）
+          - 两个子判据全 NO → F2=NO
           - 无 YES 但至少一个 UNKNOWN → F2=UNKNOWN
 
-        :param unit: 判定所属机器单元；须包含 expected_domains / expected_ports / role
-        :param alive_proxies: 本组内 F4=YES 的 proxy 描述列表，每项含 keys: ip, admin_port, bk_cloud_id；
-            对 role=backend* 的机器做 F2.d 时使用；None / 空列表 → F2.d 直接判 NO
+        说明：
+          - 历史版本还有 F2.d（proxy 后端引用检查），因语义上属于"上游 proxy 反向依赖"，
+            与 F2 单机"客户端流量"判据的抽象层次不一致；已从 F2 聚合链路中剥离。
+            :meth:`_sub_check_f2d_proxy_backends` 方法本体保留，供后续独立场景复用。
+
+        :param unit: 判定所属机器单元；须包含 expected_domains
         :param clb_regions: CLB 需检查的 region 列表；None / 空 → F2.b 判 NO（不 UNKNOWN）
         :return: :class:`FactCheckOutcome`；evidence 中携带各子判据的 state 与命中详情
         边界：
           - unit 类型不合法 -> 直接返回 UNKNOWN，避免误伤
-          - role="backend_master" / "backend_slave" 均视为 backend 类型，走 F2.d
           - unit.expected_domains 为空 → F2.a=NO（本机没预期绑域名，无所谓有没有 DNS 残留）
         """
         if not isinstance(unit, RevokeUnit):
@@ -931,28 +869,15 @@ class HostRevokeChecker:
         # ---- F2.b · CLB ----
         f2b_state, f2b_ev = self._sub_check_f2b_clb(regions=clb_regions or [])
 
-        # ---- F2.d · proxy 后端引用（仅 role 以 backend 开头才生效）----
-        role_is_backend: bool = isinstance(unit.role, str) and unit.role.startswith("backend")
-        if role_is_backend:
-            f2d_state, f2d_ev = self._sub_check_f2d_proxy_backends(unit=unit, alive_proxies=alive_proxies or [])
-        else:
-            f2d_state = FactState.NO
-            f2d_ev = {"skipped": True, "reason": "F2.d 仅对 backend 类角色启用"}
-
         # ---- 聚合 ----
         evidence: Dict[str, Any] = {
             F2_SUB_KEY_DNS: {"state": f2a_state.value, **f2a_ev},
             F2_SUB_KEY_CLB: {"state": f2b_state.value, **f2b_ev},
-            F2_SUB_KEY_PROXY_BACKENDS: {"state": f2d_state.value, **f2d_ev},
         }
-        sub_states: Tuple[FactState, FactState, FactState] = (f2a_state, f2b_state, f2d_state)
+        sub_states: Tuple[FactState, FactState] = (f2a_state, f2b_state)
 
         if FactState.YES in sub_states:
-            hits = [
-                name
-                for name, s in zip((F2_SUB_KEY_DNS, F2_SUB_KEY_CLB, F2_SUB_KEY_PROXY_BACKENDS), sub_states)
-                if s == FactState.YES
-            ]
+            hits = [name for name, s in zip((F2_SUB_KEY_DNS, F2_SUB_KEY_CLB), sub_states) if s == FactState.YES]
             return FactCheckOutcome(
                 state=FactState.YES,
                 evidence=evidence,
@@ -960,9 +885,7 @@ class HostRevokeChecker:
             )
         if FactState.UNKNOWN in sub_states:
             unknowns = [
-                name
-                for name, s in zip((F2_SUB_KEY_DNS, F2_SUB_KEY_CLB, F2_SUB_KEY_PROXY_BACKENDS), sub_states)
-                if s == FactState.UNKNOWN
+                name for name, s in zip((F2_SUB_KEY_DNS, F2_SUB_KEY_CLB), sub_states) if s == FactState.UNKNOWN
             ]
             return FactCheckOutcome(
                 state=FactState.UNKNOWN,
@@ -973,7 +896,7 @@ class HostRevokeChecker:
         return FactCheckOutcome(
             state=FactState.NO,
             evidence=evidence,
-            reason="F2=NO：三个子判据均未命中，无客户端流量残留",
+            reason="F2=NO：DNS / CLB 均未命中，无客户端流量残留",
         )
 
     def _sub_check_f2a_dns(self, expected_domains: Tuple[str, ...]) -> Tuple[FactState, Dict[str, Any]]:
@@ -1145,23 +1068,33 @@ class HostRevokeChecker:
             "expected_targets": sorted(expected_targets),
         }
 
-    def check_f3_dbm_residue(self, unit: Optional[RevokeUnit] = None) -> FactCheckOutcome:
+    def check_f3_dbm_residue(self, unit: RevokeUnit) -> FactCheckOutcome:
         """F3 · DBM 元数据残留判据：Machine / ProxyInstance / StorageInstance / StorageInstanceTuple 任一命中即 YES。
 
         怎么做：
           - 查 :class:`Machine` 表本机记录；命中 → F3.d 存在
-          - 查 :class:`ProxyInstance` / :class:`StorageInstance` 表本机 bk_host_id 相关记录；
-            若提供 unit.expected_ports，仅统计端口在预期内的实例；否则统计全部
+          - 查 :class:`ProxyInstance` / :class:`StorageInstance` 表本机 bk_host_id 相关记录，
+            按 ``unit.expected_ports`` 精确过滤本单端口的实例（多实例场景避免误伤同机他单实例）
           - 查 :class:`StorageInstanceTuple` 表本机相关的主从关系记录
           - 任一有记录 → F3=YES，evidence 按需求文档 表 5 的键名分组记录命中的对象 ID / port
 
-        :param unit: 判定所属机器单元；unit.expected_ports 用于精确过滤 instance；None 时统计整机
+        :param unit: 判定所属机器单元（必填）；unit.expected_ports 用于精确过滤 instance，
+            多实例场景下必须传入以避免整机误伤同机他单据实例
         :return: :class:`FactCheckOutcome`
         边界：
           - DB 查询异常 -> state=UNKNOWN，error 携带异常摘要
           - 全部四表均无本机相关记录 -> state=NO
+          - unit.expected_ports 为空元组时视作"无端口约束"（当前 V2 场景不会走到这里，
+            RevokeUnit 契约要求 expected_ports 非空）
         """
-        expected_ports: Tuple[int, ...] = unit.expected_ports if unit is not None else tuple()
+        if not isinstance(unit, RevokeUnit):
+            return FactCheckOutcome(
+                state=FactState.UNKNOWN,
+                error="unit is not RevokeUnit",
+                reason="F3 输入 unit 类型非法",
+            )
+        print(unit)
+        expected_ports: Tuple[int, ...] = unit.expected_ports
         try:
             # ---- F3.d · Machine ----
             machine = Machine.objects.filter(bk_host_id=self.bk_host_id).first()

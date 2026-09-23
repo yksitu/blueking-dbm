@@ -19,10 +19,6 @@ specific language governing permissions and limitations under the License.
 设计要点：
   - 所有 dataclass 使用 ``@dataclass(frozen=True)``：判定结果一经产出即不可变，避免下游误改
   - 复杂 evidence / 集合类字段一律 ``field(default_factory=...)``：规避 mutable default 陷阱
-  - 与现有 :class:`HostCheckResult` 语义可平滑映射：
-      * FactCheckOutcome.state=YES  ↔ HostCheckResult.passed=True
-      * FactCheckOutcome.state=NO   ↔ HostCheckResult.passed=False (非 check_error)
-      * FactCheckOutcome.state=UNKNOWN ↔ HostCheckResult.passed=False (reason_code=check_error)
   - 三态命名遵循需求文档口径：YES/NO/UNKNOWN 分别对应 "命中/未命中/无法确认"
 
 模块边界：

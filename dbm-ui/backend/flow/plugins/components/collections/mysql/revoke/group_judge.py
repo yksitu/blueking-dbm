@@ -43,7 +43,6 @@ specific language governing permissions and limitations under the License.
   - 组级判定天然是"汇聚型"活动，不适合再拆分为并行节点；每组一个 Service 实例
   - 组内单机判据本身独立，但为了简化编排，本 Service 在同一节点内串行跑 F1/F2/F3/F4，
     避免多节点间为传递 F 判据结果引入额外的 trans_data 字段
-  - F2.d 依赖组内 F4=YES 的 proxy 列表，天然在同节点内解决
   - 输出统一用 dataclasses.asdict 序列化为纯 dict，避免 bamboo 跨节点序列化 dataclass 问题
   - **静态字段名**：与 :class:`RevokeTransData` 预声明字段一一对应；SubProcess 隔离保证组间无冲突
 
@@ -54,6 +53,7 @@ specific language governing permissions and limitations under the License.
   - 判据采集实现细节在 :mod:`backend.flow.engine.revoke.host_check` / :mod:`.group_check`；
     决策矩阵纯函数在 :mod:`.decision`；本模块只做"编排 + 汇聚 + 出参写入"
 """
+import json
 import logging
 from dataclasses import asdict
 from enum import Enum
@@ -72,7 +72,6 @@ from backend.flow.engine.revoke.log_utils import (
     host_decision_zh,
 )
 from backend.flow.engine.revoke.models import (
-    FactState,
     GroupDecision,
     GroupVerdict,
     HostRevokeFacts,
@@ -138,12 +137,10 @@ class ResourceGroupJudgeService(BaseService):
         执行流程（与代码内 ``# ---- N. ... ----`` 段落分隔一一对应）：
           1. 参数校验与反序列化：把 kwargs.group_dict 兜回 :class:`ResourceGroup`，查出对应 Ticket
           2. 读取上游进程扫描结果：从 trans_data.host_process_check 取每台机器的进程 <ctx> JSON
-          3. 预跑 F4 进程存活判据：产出 {ip: FactState} 供第 4 步筛选存活 proxy
-          4. 挑出组内 F4=YES 的 proxy 列表：供 F2.d 判据（跑 backends RPC）复用
-          5. 逐台机器串行跑 F1/F2/F3 + 复用 F4：产出 :class:`RevokeVerdict` 单机结论
-          6. 组级 G1/G2 判据：组一致性 + 集群架构完整性
-          7. 组决策：由决策矩阵产出 :class:`GroupVerdict`；GROUP_MANUAL 时补 WARNING 日志
-          8. 将 GroupVerdict 写回 trans_data：group_verdict + group_verdict_decision 两个字段
+          3. 逐台机器串行跑 F1/F2/F3/F4：产出 :class:`RevokeVerdict` 单机结论
+          4. 组级 G1/G2 判据：组一致性 + 集群架构完整性
+          5. 组决策：由决策矩阵产出 :class:`GroupVerdict`；GROUP_MANUAL 时补 WARNING 日志
+          6. 将 GroupVerdict 写回 trans_data：group_verdict + group_verdict_decision 两个字段
 
         :param data: bamboo 节点数据对象
         :param parent_data: bamboo 父节点数据对象（不使用）
@@ -200,20 +197,11 @@ class ResourceGroupJudgeService(BaseService):
                 )
             )
             return False
-        # 提前把每台机器的 ctx 收集起来，供 F4 判据与 F2.d alive_proxies 计算复用
+        print(json.dumps(ctx_dict_all))
+        # 提前把每台机器的 ctx 收集起来，供第 3 步 F4 判据消费
         ctx_by_ip: Dict[str, Any] = {u.ip: ctx_dict_all.get(u.ip) for u in group.units}
 
-        # ---- 3. 先对每台机器采集 F4（供 F2.d 决定 alive_proxies）----
-        # 本步为内部子判据采集，不单独打每台日志；F4 结果会在第 5 步"单机结论"日志中一并展示
-        f4_map: Dict[str, "FactState"] = {}
-        for u in group.units:
-            f4_outcome = HostRevokeChecker.check_f4_process(ctx_by_ip.get(u.ip), ip=u.ip)
-            f4_map[u.ip] = f4_outcome.state
-
-        # ---- 4. 收集本组"F4=YES 的 proxy 列表"供 F2.d 使用 ----
-        alive_proxies: List[Dict[str, Any]] = _collect_alive_proxy_descriptors(group, f4_map)
-
-        # ---- 5. 对每台机器串行跑 F1/F2/F3，加上已算出的 F4，产出 RevokeVerdict ----
+        # ---- 3. 对每台机器串行跑 F1/F2/F3/F4，产出 RevokeVerdict ----
         verdicts: List[RevokeVerdict] = []
         for u in group.units:
             checker = HostRevokeChecker(
@@ -224,10 +212,9 @@ class ResourceGroupJudgeService(BaseService):
                 ip=u.ip,
                 bk_host_id=u.bk_host_id,
             )
-            f1 = checker.check_f1_ownership()
-            f2 = checker.check_f2_traffic(unit=u, alive_proxies=alive_proxies, clb_regions=clb_regions)
+            f1 = checker.check_f1_ownership(unit=u)
+            f2 = checker.check_f2_traffic(unit=u, clb_regions=clb_regions)
             f3 = checker.check_f3_dbm_residue(unit=u)
-            # 复用第 3 步产出的 F4 outcome，重新构造一次避免重复解析
             f4 = HostRevokeChecker.check_f4_process(ctx_by_ip.get(u.ip), ip=u.ip)
             facts = HostRevokeFacts(f1_ownership=f1, f2_traffic=f2, f3_dbm_residue=f3, f4_process=f4)
             verdict = HostDecisionMatrix.classify(unit=u, facts=facts)
@@ -253,12 +240,12 @@ class ResourceGroupJudgeService(BaseService):
 
         verdicts_tuple: Tuple[RevokeVerdict, ...] = tuple(verdicts)
 
-        # ---- 6. 组级 G1 / G2 判据 ----
+        # ---- 4. 组级 G1 / G2 判据 ----
         group_checker = ResourceGroupChecker(root_id=root_id)
         g1 = group_checker.check_g1_consistency(verdicts_tuple)
         g2 = group_checker.check_g2_architecture(group=group, verdicts=verdicts_tuple)
 
-        # ---- 7. 组决策 ----
+        # ---- 5. 组决策 ----
         gv: GroupVerdict = GroupDecisionMatrix.classify(group=group, verdicts=verdicts_tuple, g1=g1, g2=g2)
         # ── 组结论日志：中文为主、代号括号补充；IP 列表放最末，避免逗号断行影响主结论可读
         self.log_info(
@@ -276,7 +263,7 @@ class ResourceGroupJudgeService(BaseService):
             self.log_warning(warning_text)
             logger.warning(warning_text)
 
-        # ---- 8. 将 GroupVerdict 写入 trans_data（静态字段：SubProcess 隔离保证组间无冲突）----
+        # ---- 6. 将 GroupVerdict 写入 trans_data（静态字段：SubProcess 隔离保证组间无冲突）----
         try:
             gv_dict: Dict[str, Any] = _group_verdict_to_dict(gv)
             if trans_data is not None:
@@ -399,33 +386,3 @@ def _stringify_enums(node: Any) -> Any:
     if isinstance(node, Enum):
         return node.value
     return node
-
-
-def _collect_alive_proxy_descriptors(group: ResourceGroup, f4_map: Dict[str, FactState]) -> List[Dict[str, Any]]:
-    """从组内挑出所有 F4=YES 的 proxy，构造 F2.d 需要的 descriptor 列表。
-
-    业务动因：F2.d 判据（proxy 后端引用检查）需要拿到组内所有"存活 proxy 的 admin 端口"，
-    对这些 admin 端口跑 ``SELECT * FROM backends`` 才能判断本机 IP:port 是否仍被 proxy 引用；
-    因此每次判定组内 backend 机器的 F2 前，必须先把"F4=YES 的 proxy"筛选出来喂给 F2.d。
-
-    :param group: 资源组
-    :param f4_map: {ip: FactState} 每台机器的 F4 状态
-    :return: List[Dict{ip, admin_port, bk_cloud_id}]
-    边界：
-      - 组内无 proxy_units / 无 F4=YES 的 proxy -> 返回空列表；下游 F2.d 将直接判 NO（无流量）
-      - unit.expected_admin_ports 为空时按 ``expected_ports + 1000`` 的旧惯例兜底
-    """
-    result: List[Dict[str, Any]] = []
-    for unit in group.get_proxy_units():
-        if f4_map.get(unit.ip) != FactState.YES:
-            continue
-        admin_ports = list(unit.expected_admin_ports) or [p + 1000 for p in unit.expected_ports]
-        for ap in admin_ports:
-            result.append(
-                {
-                    "ip": unit.ip,
-                    "admin_port": ap,
-                    "bk_cloud_id": unit.bk_cloud_id,
-                }
-            )
-    return result
