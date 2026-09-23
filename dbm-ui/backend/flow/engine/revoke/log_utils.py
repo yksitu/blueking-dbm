@@ -101,28 +101,175 @@ def group_decision_zh(decision_value: str) -> str:
 
 
 def extract_decision_reason(reason: str) -> str:
-    """从 `verdict.reason` / `group_verdict.reason` 中剥离"决策=X："前缀，只保留业务原因。
+    """从 `verdict.reason` / `group_verdict.reason` 中剥离"决策=X："前缀 + 清洗 F/G 代号。
 
     功能说明：
       - :class:`HostDecisionMatrix` 与 :class:`GroupDecisionMatrix` 产出的 reason 形如
-        ``"决策=SKIP：机器已不属于本单据"`` / ``"组决策=GROUP_SKIP：组内全部机器均为 SKIP..."``
-      - 面向用户日志里代号已单独中文化展示，reason 里再重复出现代号是噪音
-      - 本函数按"首个中文冒号 `：`"切分，取右侧作为业务原因；若无冒号则返回原文
+        ``"决策=RECYCLE：F1=YES F2=NO F4=no，按 F3 evidence 精确清理"``
+        ``"组决策=GROUP_MANUAL：G1=NO 组内单机结论不一致..."``
+      - 面向用户日志里代号已单独中文化展示，reason 里再出现 F1/F2/F3/F4/G1/G2 是噪音
+      - 本函数分两步清洗：
+          1) 按"首个中文冒号 `：`"切分，取右侧作为业务原因（剥离 `决策=X：` 前缀）
+          2) 用固定映射把 reason 里的 F/G 代号替换为业务白话
 
     :param reason: 原始 reason 字符串
-    :return: 剥离代号前缀后的业务原因；未匹配前缀时返回原文（fail-safe）
+    :return: 剥离前缀 + 清洗代号后的业务原因；未匹配前缀时对原文做代号清洗后返回
 
     示例：
-      >>> extract_decision_reason("决策=SKIP：机器已不属于本单据")
-      '机器已不属于本单据'
-      >>> extract_decision_reason("组决策=GROUP_MANUAL：G1=NO 组内单机结论不一致，构成 {...}")
-      'G1=NO 组内单机结论不一致，构成 {...}'
-      >>> extract_decision_reason("无冒号原文")
-      '无冒号原文'
+      >>> extract_decision_reason("决策=RECYCLE：F1=YES F2=NO F4=no，按 F3 evidence 精确清理")
+      '归属本单据，无 DNS/CLB 绑定，无进程，按元数据残留证据精确清理'
+      >>> extract_decision_reason("组决策=GROUP_MANUAL：G1=NO 组内单机结论不一致")
+      '组内结论不一致'
     """
     if not reason:
         return ""
+    # 步骤 1：剥离前缀（"决策=X：" / "组决策=Y："）
     idx = reason.find("：")
-    if idx < 0:
-        return reason
-    return reason[idx + 1 :].strip()
+    body = reason[idx + 1 :].strip() if idx >= 0 else reason
+
+    # 步骤 2：F/G 代号 → 业务白话（顺序敏感：先长后短，避免部分匹配）
+    # 说明：这里的替换只影响面向用户的日志输出，不影响 verdict.reason 原文
+    #      （告警平台 / 单测 grep 仍可用原代号定位）
+    replacements: list = [
+        # G 判据（放最前，避免被 F 判据模式误匹配）
+        ("G1=YES", "组内结论一致"),
+        ("G1=NO", "组内结论不一致"),
+        ("G1=UNKNOWN", "组内一致性未知"),
+        ("G2=YES", "集群架构完整"),
+        ("G2=NO", "集群架构不完整"),
+        ("G2=UNKNOWN", "集群架构完整性未知"),
+        # F 判据
+        ("F1=YES", "归属本单据"),
+        ("F1=NO", "已被非法移动/重新入池"),
+        ("F1=UNKNOWN", "归属状态未知"),
+        ("F2=YES", "有 DNS/CLB 绑定"),
+        ("F2=NO", "无 DNS/CLB 绑定"),
+        ("F2=UNKNOWN", "DNS/CLB 绑定状态未知"),
+        ("F3=YES", "有元数据残留"),
+        ("F3=NO", "无元数据残留"),
+        ("F3=UNKNOWN", "元数据残留状态未知"),
+        ("F4=YES", "进程存活"),
+        ("F4=NO", "无进程"),
+        ("F4=UNKNOWN", "进程状态未知"),
+        # 兼容 decision.py 里对 F4 小写 yes/no（历史遗留写法）
+        ("F4=yes", "进程存活"),
+        ("F4=no", "无进程"),
+        # 固定短语（放最后，避免 F3 代号已被替换后再匹配失效）
+        ("按 F3 evidence 精确清理", "按元数据残留证据精确清理"),
+    ]
+    for old, new in replacements:
+        body = body.replace(old, new)
+    return body
+
+
+# ==========================================================================
+# F/G 判据 state 值 → 业务白话映射（供单机日志"检测项"段落使用）
+# --------------------------------------------------------------------------
+# 使用场景：面向用户的判据结果输出（"是 / 否 / 未知" 三态白话），配合固定检测项
+# 名称一起展示，让 DBA / SRE 一眼看懂"检测了什么、结果如何"，避免代号泄露。
+# 输入统一为 :class:`FactState` 的 .value 字符串（yes / no / unknown），
+# 未知代号 fail-safe 回退代号原文。
+# ==========================================================================
+
+
+#: F1 · 是否存在非法移动/重新入池
+#: state=YES 表示"归属本单据（正常）" -> 面向用户是"否（不存在非法移动）"
+#: state=NO 表示"不归属本单据（异常）" -> 面向用户是"是（存在非法移动/重新入池）"
+F1_STATE_ZH: dict = {
+    "yes": "否",
+    "no": "是",
+    "unknown": "未知",
+}
+
+#: F2 · 是否绑定 DNS 或 CLB 服务
+#: state=YES 表示"有 DNS/CLB 引用（红线）" -> "是"
+#: state=NO 表示"无 DNS/CLB 引用" -> "否"
+F2_STATE_ZH: dict = {
+    "yes": "是",
+    "no": "否",
+    "unknown": "未知",
+}
+
+#: F3 · 是否有元数据残留
+#: state=YES 表示"存在元数据残留" -> "有"
+F3_STATE_ZH: dict = {
+    "yes": "有",
+    "no": "无",
+    "unknown": "未知",
+}
+
+#: F4 · 进程是否存活
+#: state=YES 表示"本单端口进程仍在跑" -> "有"
+F4_STATE_ZH: dict = {
+    "yes": "有",
+    "no": "无",
+    "unknown": "未知",
+}
+
+#: G1 · 组内单机结论一致性
+G1_STATE_ZH: dict = {
+    "yes": "一致",
+    "no": "不一致",
+    "unknown": "未知",
+}
+
+#: G2 · 集群架构完整性
+G2_STATE_ZH: dict = {
+    "yes": "满足",
+    "no": "不满足",
+    "unknown": "未知",
+}
+
+
+def f1_zh(state_value: str) -> str:
+    """F1 · 是否存在非法移动/重新入池 · state → 白话。
+
+    :param state_value: :class:`FactState` 的 .value（yes / no / unknown）
+    :return: 面向用户的白话（"否" / "是" / "未知"）；未知代号回退原文
+    """
+    return F1_STATE_ZH.get(state_value, state_value)
+
+
+def f2_zh(state_value: str) -> str:
+    """F2 · 是否绑定 DNS 或 CLB 服务 · state → 白话。
+
+    :param state_value: :class:`FactState` 的 .value（yes / no / unknown）
+    :return: 面向用户的白话（"是" / "否" / "未知"）；未知代号回退原文
+    """
+    return F2_STATE_ZH.get(state_value, state_value)
+
+
+def f3_zh(state_value: str) -> str:
+    """F3 · 是否有元数据残留 · state → 白话。
+
+    :param state_value: :class:`FactState` 的 .value（yes / no / unknown）
+    :return: 面向用户的白话（"有" / "无" / "未知"）；未知代号回退原文
+    """
+    return F3_STATE_ZH.get(state_value, state_value)
+
+
+def f4_zh(state_value: str) -> str:
+    """F4 · 进程是否存活 · state → 白话。
+
+    :param state_value: :class:`FactState` 的 .value（yes / no / unknown）
+    :return: 面向用户的白话（"有" / "无" / "未知"）；未知代号回退原文
+    """
+    return F4_STATE_ZH.get(state_value, state_value)
+
+
+def g1_zh(state_value: str) -> str:
+    """G1 · 组内单机结论一致性 · state → 白话。
+
+    :param state_value: :class:`FactState` 的 .value（yes / no / unknown）
+    :return: 面向用户的白话（"一致" / "不一致" / "未知"）；未知代号回退原文
+    """
+    return G1_STATE_ZH.get(state_value, state_value)
+
+
+def g2_zh(state_value: str) -> str:
+    """G2 · 集群架构完整性 · state → 白话。
+
+    :param state_value: :class:`FactState` 的 .value（yes / no / unknown）
+    :return: 面向用户的白话（"满足" / "不满足" / "未知"）；未知代号回退原文
+    """
+    return G2_STATE_ZH.get(state_value, state_value)

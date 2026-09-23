@@ -67,7 +67,12 @@ from backend.flow.engine.revoke.group_check import ResourceGroupChecker, build_g
 from backend.flow.engine.revoke.host_check import HostRevokeChecker
 from backend.flow.engine.revoke.log_utils import (
     extract_decision_reason,
-    format_group_ips,
+    f1_zh,
+    f2_zh,
+    f3_zh,
+    f4_zh,
+    g1_zh,
+    g2_zh,
     group_decision_zh,
     host_decision_zh,
 )
@@ -178,8 +183,6 @@ class ResourceGroupJudgeService(BaseService):
             return False
 
         root_id: str = kwargs.get("root_id") or "unknown-root"
-        # 日志主标识：与 act_name / cleanup Service 保持一致的 IP 列表字符串
-        ips_display: str = format_group_ips(group)
         # ── 入口日志：不嵌入 IP 列表（避免前端在逗号处断行），IP 信息已在 act_name 里
         self.log_info(_("开始判定本组 {n} 台主机（单据 {ticket_id}）").format(n=len(group.units), ticket_id=ticket_id))
 
@@ -197,7 +200,7 @@ class ResourceGroupJudgeService(BaseService):
                 )
             )
             return False
-        print(json.dumps(ctx_dict_all))
+        self.log_info(json.dumps(ctx_dict_all))
         # 提前把每台机器的 ctx 收集起来，供第 3 步 F4 判据消费
         ctx_by_ip: Dict[str, Any] = {u.ip: ctx_dict_all.get(u.ip) for u in group.units}
 
@@ -218,22 +221,37 @@ class ResourceGroupJudgeService(BaseService):
             f4 = HostRevokeChecker.check_f4_process(ctx_by_ip.get(u.ip), ip=u.ip)
             facts = HostRevokeFacts(f1_ownership=f1, f2_traffic=f2, f3_dbm_residue=f3, f4_process=f4)
             verdict = HostDecisionMatrix.classify(unit=u, facts=facts)
-            # ── 单机结论日志：F 判据 + 决策 + 业务原因，合成一行，避免两条重复刷屏
+            # ── 单机结论日志：草稿 A 详细版 · 一次 log_info 输出多行，固定格式便于阅读
+            #    每台机器一个完整块：横线分隔 + 主机基本信息 + 检测项 4 项 + 判定结果
             self.log_info(
                 _(
-                    "主机 {ip}（bk_host_id={host_id}, 角色={role}）· 判定={decision_zh}（{decision}）"
-                    " · 原因：{reason} · F1={f1} F2={f2} F3={f3} F4={f4}"
+                    "\n{sep}\n"
+                    "主机: {ip}\n"
+                    "主机ID: {host_id}\n"
+                    "角色: {role}\n"
+                    "\n"
+                    "【检测项】\n"
+                    "  ① 是否存在非法移动/重新入池  : {f1_zh}\n"
+                    "  ② 是否绑定 DNS 或 CLB 服务   : {f2_zh}\n"
+                    "  ③ 是否有元数据残留           : {f3_zh}\n"
+                    "  ④ 进程是否存活               : {f4_zh}\n"
+                    "\n"
+                    "【判定结果】\n"
+                    "  {decision_zh}（{decision}）\n"
+                    "  说明: {reason}\n"
+                    "{sep}"
                 ).format(
+                    sep="━" * 60,
                     ip=u.ip,
                     host_id=u.bk_host_id,
                     role=u.role,
+                    f1_zh=f1_zh(f1.state.value),
+                    f2_zh=f2_zh(f2.state.value),
+                    f3_zh=f3_zh(f3.state.value),
+                    f4_zh=f4_zh(f4.state.value),
                     decision_zh=host_decision_zh(verdict.decision.value),
                     decision=verdict.decision.value.upper(),
                     reason=extract_decision_reason(verdict.reason),
-                    f1=f1.state.value.upper(),
-                    f2=f2.state.value.upper(),
-                    f3=f3.state.value.upper(),
-                    f4=f4.state.value.upper(),
                 )
             )
             verdicts.append(verdict)
@@ -247,14 +265,39 @@ class ResourceGroupJudgeService(BaseService):
 
         # ---- 5. 组决策 ----
         gv: GroupVerdict = GroupDecisionMatrix.classify(group=group, verdicts=verdicts_tuple, g1=g1, g2=g2)
-        # ── 组结论日志：中文为主、代号括号补充；IP 列表放最末，避免逗号断行影响主结论可读
+        # ── 组结论日志：多行格式 · 每行一个 IP + 组级检测 G1/G2 + 最终决策
+        #    与单机日志同风格：横线分隔 + 段落 + 【组级检测】/【最终决策】
+        ip_lines: str = "\n".join("    - {}".format(u.ip) for u in group.units)
         self.log_info(
-            _("本组结论：{decision_zh}（{decision}） · {reason} · IP: {ips} · group_id={group_id}").format(
+            _(
+                "\n{sep}\n"
+                "本组判定结论\n"
+                "{sep}\n"
+                "\n"
+                "  组 ID       : {group_id}\n"
+                "  组内主机数  : {n} 台\n"
+                "\n"
+                "  组内主机    :\n"
+                "{ip_lines}\n"
+                "\n"
+                "  【组级检测】\n"
+                "    ⑤ 组内单机结论一致性  : {g1_zh}\n"
+                "    ⑥ 集群架构完整性      : {g2_zh}\n"
+                "\n"
+                "  【最终决策】\n"
+                "    {decision_zh}（{decision}）\n"
+                "    说明: {reason}\n"
+                "{sep}"
+            ).format(
+                sep="━" * 60,
+                group_id=group.group_id,
+                n=len(group.units),
+                ip_lines=ip_lines,
+                g1_zh=g1_zh(g1.state.value),
+                g2_zh=g2_zh(g2.state.value),
                 decision_zh=group_decision_zh(gv.decision.value),
                 decision=gv.decision.value.upper(),
                 reason=extract_decision_reason(gv.reason),
-                ips=ips_display,
-                group_id=group.group_id,
             )
         )
         # 组挂起时输出结构化 WARNING 日志（供告警平台捕获）
@@ -269,6 +312,7 @@ class ResourceGroupJudgeService(BaseService):
             if trans_data is not None:
                 setattr(trans_data, "group_verdict", gv_dict)
                 setattr(trans_data, "group_verdict_decision", gv.decision.value)
+            data.outputs["trans_data"] = trans_data
         except Exception as err:
             self.log_error(_("[{}] 写入 trans_data 失败: {}").format(node_name, err))
             return False
