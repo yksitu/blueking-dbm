@@ -66,6 +66,7 @@ from backend.flow.engine.revoke.decision import GroupDecisionMatrix, HostDecisio
 from backend.flow.engine.revoke.group_check import ResourceGroupChecker, build_group_warning_log
 from backend.flow.engine.revoke.host_check import HostRevokeChecker
 from backend.flow.engine.revoke.log_utils import (
+    G2_STATE_ZH,
     extract_decision_reason,
     f1_zh,
     f2_zh,
@@ -294,7 +295,7 @@ class ResourceGroupJudgeService(BaseService):
                 n=len(group.units),
                 ip_lines=ip_lines,
                 g1_zh=g1_zh(g1.state.value),
-                g2_zh=g2_zh(g2.state.value),
+                g2_zh=g2_zh(g2.state.value) if g2 is not None else G2_STATE_ZH["no"],
                 decision_zh=group_decision_zh(gv.decision.value),
                 decision=gv.decision.value.upper(),
                 reason=extract_decision_reason(gv.reason),
