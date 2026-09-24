@@ -126,7 +126,7 @@ def build_group_revoke_subflow(
         write_payload_var="host_process_check",
     )
 
-    # ---- 段 2：组级判定汇聚 F1~F4 + G1/G2 + 决策矩阵 ----
+    # ---- 段 2：组级判定汇聚 F1~F4 + Group决策矩阵 ----
     # 段 2 直接读 trans_data.host_process_check，无需通过 kwargs 传字段名
     sub_pipeline.add_act(
         act_name=_("组级判定 [{ips}]").format(ips=ips_display),

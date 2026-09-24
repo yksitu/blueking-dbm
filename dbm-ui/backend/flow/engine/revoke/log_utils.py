@@ -135,9 +135,6 @@ def extract_decision_reason(reason: str) -> str:
         ("G1=YES", "组内结论一致"),
         ("G1=NO", "组内结论不一致"),
         ("G1=UNKNOWN", "组内一致性未知"),
-        ("G2=YES", "集群架构完整"),
-        ("G2=NO", "集群架构不完整"),
-        ("G2=UNKNOWN", "集群架构完整性未知"),
         # F 判据
         ("F1=YES", "归属本单据"),
         ("F1=NO", "已被非法移动/重新入池"),
@@ -213,13 +210,6 @@ G1_STATE_ZH: dict = {
     "unknown": "未知",
 }
 
-#: G2 · 集群架构完整性
-G2_STATE_ZH: dict = {
-    "yes": "满足",
-    "no": "不满足",
-    "unknown": "未知",
-}
-
 
 def f1_zh(state_value: str) -> str:
     """F1 · 是否存在非法移动/重新入池 · state → 白话。
@@ -264,12 +254,3 @@ def g1_zh(state_value: str) -> str:
     :return: 面向用户的白话（"一致" / "不一致" / "未知"）；未知代号回退原文
     """
     return G1_STATE_ZH.get(state_value, state_value)
-
-
-def g2_zh(state_value: str) -> str:
-    """G2 · 集群架构完整性 · state → 白话。
-
-    :param state_value: :class:`FactState` 的 .value（yes / no / unknown）
-    :return: 面向用户的白话（"满足" / "不满足" / "未知"）；未知代号回退原文
-    """
-    return G2_STATE_ZH.get(state_value, state_value)

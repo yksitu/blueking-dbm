@@ -16,7 +16,7 @@ specific language governing permissions and limitations under the License.
          的每台机器 <ctx> JSON（结构 ``{ip: <ctx_dict>}``）
       2) 对组内每台机器构造 :class:`HostRevokeChecker` 分别跑 F1/F2/F3/F4 判据
       3) 调 :class:`HostDecisionMatrix` 得单机 :class:`RevokeVerdict`
-      4) 调 :class:`ResourceGroupChecker` 跑 G1/G2 组级判据
+      4) 调 :class:`ResourceGroupChecker` 跑 G1 组级判据
       5) 调 :class:`GroupDecisionMatrix` 得 :class:`GroupVerdict`
       6) 将 GroupVerdict 序列化为 dict 写入 ``trans_data.group_verdict``，
          组决策字符串写入 ``trans_data.group_verdict_decision``，供下游清理子流程读取
@@ -28,7 +28,6 @@ specific language governing permissions and limitations under the License.
   - **F3 · DBM 元数据残留**：DBM 侧 Machine / ProxyInstance / StorageInstance / StorageInstanceTuple 四张表是否还有本机记录
   - **F4 · 进程存活**：本机上是否还在跑 MySQL / mysql-proxy / mariadbd 等 MySQL 家族进程
   - **G1 · 组内一致性**：组内所有机器的单机决策是否完全一致（不一致则挂起等 DBA 排查）
-  - **G2 · 集群架构完整性**：清理前 proxy 的 backends 是否已收敛到本组 backend_master（不完整则保守挂起）
 
 组决策取值 · 业务翻译：
   - **GROUP_RECYCLE**：本组可安全自动清理（下游走完整清理链路 A/C/D/E）
@@ -66,14 +65,12 @@ from backend.flow.engine.revoke.decision import GroupDecisionMatrix, HostDecisio
 from backend.flow.engine.revoke.group_check import ResourceGroupChecker, build_group_warning_log
 from backend.flow.engine.revoke.host_check import HostRevokeChecker
 from backend.flow.engine.revoke.log_utils import (
-    G2_STATE_ZH,
     extract_decision_reason,
     f1_zh,
     f2_zh,
     f3_zh,
     f4_zh,
     g1_zh,
-    g2_zh,
     group_decision_zh,
     host_decision_zh,
 )
@@ -122,12 +119,11 @@ class ResourceGroupJudgeService(BaseService):
         - F1=YES + F2=UNKNOWN → MANUAL（红线判据不确定，保守挂起）
         - F1=YES + F2=NO + F4=YES/NO → RECYCLE（无流量、进程状态已知，可清理）
         - F1=YES + F2=NO + F4=UNKNOWN → MANUAL（进程未知不敢自动清理）
-      **G1/G2 组级判据**：G1=组内一致性 · G2=集群架构完整性
+      **G1 组级判据**：G1=组内一致性
       **组决策关键分支**（``GroupDecisionMatrix.classify``）：
         - G1=NO/UNKNOWN → GROUP_MANUAL（组内单机结论不一致，挂起）
-        - G1=YES + 全 SKIP → GROUP_SKIP · 全 KEEP → GROUP_KEEP
-        - G1=YES + 全 RECYCLE + G2=YES/不适用 → GROUP_RECYCLE（可清理）
-        - G1=YES + 全 RECYCLE + G2=NO/UNKNOWN → GROUP_MANUAL（架构不完整，保守挂起）
+        - G1=YES + 全 SKIP → GROUP_SKIP · 全 KEEP → GROUP_KEEP · 全 RECYCLE → GROUP_RECYCLE
+        - G1=YES 但组内结论构成异常（含 MANUAL / RECYCLE+KEEP 等）→ GROUP_MANUAL
 
     线程安全：非线程安全（Service 生命周期由 bamboo 管理，单节点单实例）
     边界：
@@ -144,7 +140,7 @@ class ResourceGroupJudgeService(BaseService):
           1. 参数校验与反序列化：把 kwargs.group_dict 兜回 :class:`ResourceGroup`，查出对应 Ticket
           2. 读取上游进程扫描结果：从 trans_data.host_process_check 取每台机器的进程 <ctx> JSON
           3. 逐台机器串行跑 F1/F2/F3/F4：产出 :class:`RevokeVerdict` 单机结论
-          4. 组级 G1/G2 判据：组一致性 + 集群架构完整性
+          4. 组级 G1 判据：组一致性
           5. 组决策：由决策矩阵产出 :class:`GroupVerdict`；GROUP_MANUAL 时补 WARNING 日志
           6. 将 GroupVerdict 写回 trans_data：group_verdict + group_verdict_decision 两个字段
 
@@ -153,7 +149,7 @@ class ResourceGroupJudgeService(BaseService):
         :return: True 判定完成；False 表示节点失败（关键字段缺失）
         边界：
           - 任一关键字段缺失 / 反序列化失败 -> log error 后返回 False，节点失败
-          - 单机 F 判据 / 组级 G 判据的所有异常均在下层被收敛为 FactState.UNKNOWN，不上抛到本方法
+          - 单机 F 判据 / 组级 G1 判据的所有异常均在下层被收敛为 FactState.UNKNOWN，不上抛到本方法
           - 写 trans_data 异常（理论不可达）-> log error 后返回 False
         """
         kwargs: Dict[str, Any] = data.get_one_of_inputs("kwargs") or {}
@@ -259,14 +255,13 @@ class ResourceGroupJudgeService(BaseService):
 
         verdicts_tuple: Tuple[RevokeVerdict, ...] = tuple(verdicts)
 
-        # ---- 4. 组级 G1 / G2 判据 ----
+        # ---- 4. 组级 G1 判据 ----
         group_checker = ResourceGroupChecker(root_id=root_id)
         g1 = group_checker.check_g1_consistency(verdicts_tuple)
-        g2 = group_checker.check_g2_architecture(group=group, verdicts=verdicts_tuple)
 
         # ---- 5. 组决策 ----
-        gv: GroupVerdict = GroupDecisionMatrix.classify(group=group, verdicts=verdicts_tuple, g1=g1, g2=g2)
-        # ── 组结论日志：多行格式 · 每行一个 IP + 组级检测 G1/G2 + 最终决策
+        gv: GroupVerdict = GroupDecisionMatrix.classify(group=group, verdicts=verdicts_tuple, g1=g1)
+        # ── 组结论日志：多行格式 · 每行一个 IP + 组级检测 G1 + 最终决策
         #    与单机日志同风格：横线分隔 + 段落 + 【组级检测】/【最终决策】
         ip_lines: str = "\n".join("    - {}".format(u.ip) for u in group.units)
         self.log_info(
@@ -283,7 +278,6 @@ class ResourceGroupJudgeService(BaseService):
                 "\n"
                 "  【组级检测】\n"
                 "    ⑤ 组内单机结论一致性  : {g1_zh}\n"
-                "    ⑥ 集群架构完整性      : {g2_zh}\n"
                 "\n"
                 "  【最终决策】\n"
                 "    {decision_zh}（{decision}）\n"
@@ -295,7 +289,6 @@ class ResourceGroupJudgeService(BaseService):
                 n=len(group.units),
                 ip_lines=ip_lines,
                 g1_zh=g1_zh(g1.state.value),
-                g2_zh=g2_zh(g2.state.value) if g2 is not None else G2_STATE_ZH["no"],
                 decision_zh=group_decision_zh(gv.decision.value),
                 decision=gv.decision.value.upper(),
                 reason=extract_decision_reason(gv.reason),
@@ -384,9 +377,6 @@ def _dict_to_resource_group(d: Dict[str, Any]) -> ResourceGroup:
             bk_biz_id=int(x["bk_biz_id"]),
             role=str(x["role"]),
             expected_ports=tuple(x.get("expected_ports") or []),
-            expected_admin_ports=tuple(x.get("expected_admin_ports") or []),
-            expected_domains=tuple(x.get("expected_domains") or []),
-            expected_cluster_domains=tuple(x.get("expected_cluster_domains") or []),
             cluster_type=str(x.get("cluster_type") or ""),
         )
         for x in d.get("units") or []

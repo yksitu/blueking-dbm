@@ -11,7 +11,7 @@ specific language governing permissions and limitations under the License.
 主机退回资源池 · 判定模型核心数据结构。
 
 模块职责：
-  - 定义 F1~F4 单机判据与 G1/G2 组级判据的 3 态结果类型（FactState / FactCheckOutcome）
+  - 定义 F1~F4 单机判据与 G1 组级判据的 3 态结果类型（FactState / FactCheckOutcome）
   - 定义单机判据快照（HostRevokeFacts）与单机决策结论（HostDecision）
   - 定义组级判定单元（RevokeUnit / ResourceGroup）
   - 定义单机 / 组级最终判定结论（RevokeVerdict / GroupVerdict）
@@ -70,11 +70,11 @@ class HostDecision(StrStructuredEnum):
 class GroupDecision(StrStructuredEnum):
     """组级决策结论。
 
-    使用场景：`GroupDecisionMatrix.classify()` 对 G1 + G2 + 组内单机结论组合的映射产出。
+    使用场景：`GroupDecisionMatrix.classify()` 对 G1 + 组内单机结论组合的映射产出。
 
     :cvar GROUP_SKIP: 组内所有机器均 SKIP；整组不做任何动作
     :cvar GROUP_KEEP: 组内所有机器均 KEEP；红线保留整组
-    :cvar GROUP_MANUAL: 组内出现混合 / MANUAL / G2 失败；整组挂起，不清理，输出告警日志
+    :cvar GROUP_MANUAL: 组内出现混合 / MANUAL；整组挂起，不清理，输出告警日志
     :cvar GROUP_RECYCLE: 组内所有机器均 RECYCLE 且 G2 通过（或不适用）；走清理子流程
     """
 
@@ -210,9 +210,8 @@ class RevokeUnit:
     设计要点：
       - 角色由 Extractor **硬编码指定**（如 "proxy" / "backend_master" / "backend_slave"），
         不依赖运行时反查 DBM 元数据，避免部署未完成时角色不可知
-      - ``expected_ports`` / ``expected_domains`` 是本单在该机器上"应该"绑的资源；判定时用于反查残留
-      - ``expected_admin_ports`` 仅对 proxy 角色有意义（proxy_port + 1000），供 F2.d / G2 用
-      - 端口 / 域名列表都是有序 tuple（frozen dataclass 内不允许放 list 作 hashable 字段，
+      - ``expected_ports`` 是本单在该机器上"应该"绑的端口；判定时用于反查残留 / 精确探测
+      - 端口列表是有序 tuple（frozen dataclass 内不允许放 list 作 hashable 字段，
         虽然本类未强制 __hash__，但保持 tuple 便于跨节点序列化时的稳定性）
 
     :param ip: 主机 IP
@@ -221,12 +220,8 @@ class RevokeUnit:
     :param bk_biz_id: 业务 ID
     :param role: 硬编码角色字符串，取值：proxy / backend_master / backend_slave /
         spider / remote_master / remote_slave / single / spider_slave / spider_mnt
-    :param expected_ports: 本单在该机器上申领的端口列表（多实例场景 N 个）
-    :param expected_admin_ports: 本单在该机器上的 admin 端口列表
-        （proxy 角色为 proxy_port+1000；其他角色为空）
-    :param expected_domains: 本单在该机器上预期绑定的域名列表
-        （proxy 绑 master 域名、backend_slave 绑 slave 域名、backend_master 通常为空）
-    :param expected_cluster_domains: 本组承载的所有集群主域名列表（供 F3 反查 Cluster 元数据用）
+    :param expected_ports: 本单在该机器上申领的端口列表（多实例场景 N 个）；
+        F3/F4 判据据此按端口精确过滤；group_cleanup 据此按端口精确摘 DNS
     :param cluster_type: 集群类型（决定 F2.c tdbctl 判据是否启用；本次 HA 场景固定为 tendbha）
     """
 
@@ -236,9 +231,6 @@ class RevokeUnit:
     bk_biz_id: int
     role: str
     expected_ports: Tuple[int, ...] = field(default_factory=tuple)
-    expected_admin_ports: Tuple[int, ...] = field(default_factory=tuple)
-    expected_domains: Tuple[str, ...] = field(default_factory=tuple)
-    expected_cluster_domains: Tuple[str, ...] = field(default_factory=tuple)
     cluster_type: str = ""
 
     def __post_init__(self) -> None:
@@ -365,13 +357,12 @@ class RevokeVerdict:
 class GroupVerdict:
     """一组资源的组级最终判定结论。
 
-    职责：`GroupDecisionMatrix.classify()` 的产出；把组内所有 RevokeVerdict + G1/G2 收敛为组决策。
+    职责：`GroupDecisionMatrix.classify()` 的产出；把组内所有 RevokeVerdict + G1 收敛为组决策。
 
     :param group: 判定所属的资源组
     :param decision: 组决策结论（GROUP_SKIP / GROUP_KEEP / GROUP_MANUAL / GROUP_RECYCLE）
     :param verdicts: 组内每台机器的单机 RevokeVerdict
     :param g1: G1 · 组内一致性判据结果
-    :param g2: G2 · 集群架构完整性判据结果；不适用场景为 None
     :param reason: 人类可读的组决策原因，特别是 GROUP_MANUAL 时的挂起原因文本
     """
 
@@ -379,7 +370,6 @@ class GroupVerdict:
     decision: GroupDecision
     verdicts: Tuple[RevokeVerdict, ...]
     g1: FactCheckOutcome
-    g2: Optional[FactCheckOutcome] = None
     reason: str = ""
 
     def __post_init__(self) -> None:
@@ -397,8 +387,6 @@ class GroupVerdict:
             raise RevokeFlowBaseException("GroupVerdict.decision must be GroupDecision")
         if not isinstance(self.g1, FactCheckOutcome):
             raise RevokeFlowBaseException("GroupVerdict.g1 must be FactCheckOutcome")
-        if self.g2 is not None and not isinstance(self.g2, FactCheckOutcome):
-            raise RevokeFlowBaseException("GroupVerdict.g2 must be FactCheckOutcome or None")
         for v in self.verdicts:
             if not isinstance(v, RevokeVerdict):
                 raise RevokeFlowBaseException(

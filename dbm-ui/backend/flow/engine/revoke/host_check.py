@@ -834,8 +834,9 @@ class HostRevokeChecker:
         """F2 · 客户端流量红线判据：DNS / CLB 任一命中即 YES（红线保留）。
 
         怎么做（两个子判据并列跑）：
-          - F2.a · DNS：调 :meth:`check_dns_mapping`；DNS 记录里出现 ``unit.expected_domains``
-            中任一域名 → F2.a=YES；DNS 完全无本机记录 → F2.a=NO；DNS 接口异常 → F2.a=UNKNOWN
+          - F2.a · DNS：调 :meth:`check_dns_mapping`；DNS 服务里只要查到本机 IP 的
+            **任何**解析记录 → F2.a=YES（红线：出现即视为客户端流量残留 / 跨业务混用）；
+            DNS 完全无本机记录 → F2.a=NO；DNS 接口异常 → F2.a=UNKNOWN
           - F2.b · CLB：调 :meth:`check_clb_mapping`；命中 → F2.b=YES；未命中 → F2.b=NO；
             未提供 region 视为 NO；CLB 查询异常 → F2.b=UNKNOWN
 
@@ -847,14 +848,12 @@ class HostRevokeChecker:
         说明：
           - 历史版本还有 F2.d（proxy 后端引用检查），因语义上属于"上游 proxy 反向依赖"，
             与 F2 单机"客户端流量"判据的抽象层次不一致；已从 F2 聚合链路中剥离。
-            :meth:`_sub_check_f2d_proxy_backends` 方法本体保留，供后续独立场景复用。
 
-        :param unit: 判定所属机器单元；须包含 expected_domains
+        :param unit: 判定所属机器单元
         :param clb_regions: CLB 需检查的 region 列表；None / 空 → F2.b 判 NO（不 UNKNOWN）
         :return: :class:`FactCheckOutcome`；evidence 中携带各子判据的 state 与命中详情
         边界：
           - unit 类型不合法 -> 直接返回 UNKNOWN，避免误伤
-          - unit.expected_domains 为空 → F2.a=NO（本机没预期绑域名，无所谓有没有 DNS 残留）
         """
         if not isinstance(unit, RevokeUnit):
             return FactCheckOutcome(
@@ -864,7 +863,7 @@ class HostRevokeChecker:
             )
 
         # ---- F2.a · DNS ----
-        f2a_state, f2a_ev = self._sub_check_f2a_dns(expected_domains=unit.expected_domains)
+        f2a_state, f2a_ev = self._sub_check_f2a_dns()
 
         # ---- F2.b · CLB ----
         f2b_state, f2b_ev = self._sub_check_f2b_clb(regions=clb_regions or [])
@@ -899,40 +898,36 @@ class HostRevokeChecker:
             reason="F2=NO：DNS / CLB 均未命中，无客户端流量残留",
         )
 
-    def _sub_check_f2a_dns(self, expected_domains: Tuple[str, ...]) -> Tuple[FactState, Dict[str, Any]]:
+    def _sub_check_f2a_dns(self) -> Tuple[FactState, Dict[str, Any]]:
         """F2.a · DNS 子判据（内部辅助）。
 
-        怎么做：
-          - 复用 :meth:`check_dns_mapping` 拿到 IP 上所有 DNS 记录
-          - 从 records 中筛选出 ``expected_domains`` 命中项；命中即 YES
-          - 若 DNS 完全无本机记录 → NO；接口异常 → UNKNOWN
+        判定语义（严格版 · 红线优先）：
+          - 只要 DNS 服务里查到本机 IP 的任何解析记录 → **YES**（红线，禁止退回）
+              * 无论域名是什么：出现即视为客户端流量残留 / 跨业务混用；
+                此时清理机器风险极大
+          - DNS 完全无本机记录 → NO（干净）
+          - DNS 接口异常 → UNKNOWN（保守）
 
-        :param expected_domains: 本单在本机预期绑定的域名列表
-        :return: (state, evidence)；evidence 携带命中的域名列表与全部 dns 响应摘要
+        :return: (state, evidence)；YES 时 evidence 列出 dns_records（原始记录）与
+            domain_names（去重排序的域名列表，肉眼一眼看清）
         边界：
-          - expected_domains 为空 → 直接 NO（本机不该绑域名，无关注价值）
+          - 本方法不依赖任何"预期域名"清单，只看 DNS 是否有本机记录
         """
-        if not expected_domains:
-            return FactState.NO, {"skipped": True, "reason": "本机无预期域名，F2.a 不适用"}
-
         r = self.check_dns_mapping()
-        # r.reason_code == CHECK_ERROR -> UNKNOWN
+        # DNS 接口异常 → UNKNOWN
         if r.reason_code == HostCheckReasonCode.CHECK_ERROR:
             return FactState.UNKNOWN, {"error": r.reason, "evidence": r.evidence}
-        # r.reason_code == IP_NO_DNS_RECORD -> NO
+        # DNS 无记录 → NO（干净）
         if r.reason_code == HostCheckReasonCode.IP_NO_DNS_RECORD:
             return FactState.NO, {"dns_records": []}
-        # 有 DNS 记录：判断是否命中 expected_domains
-        expected_set = set(expected_domains)
+
+        # 有 DNS 记录：一律红线 YES
         records: List[Dict[str, Any]] = r.evidence.get("records", []) if isinstance(r.evidence, dict) else []
-        matched: List[Dict[str, Any]] = [rec for rec in records if rec.get("domain_name") in expected_set]
-        if matched:
-            return FactState.YES, {"matched_records": matched, "expected_domains": list(expected_domains)}
-        # 有别的域名但没命中本单预期 → 视作 NO（可能是别的单据的历史残留，不在本单红线范围）
-        return FactState.NO, {
+        domain_names: List[str] = sorted({str(rec.get("domain_name")) for rec in records if rec.get("domain_name")})
+
+        return FactState.YES, {
             "dns_records": records,
-            "expected_domains": list(expected_domains),
-            "matched_records": [],
+            "domain_names": domain_names,
         }
 
     def _sub_check_f2b_clb(self, regions: List[str]) -> Tuple[FactState, Dict[str, Any]]:

@@ -17,16 +17,9 @@ TenDBHA 部署单据主机退回顶层编排 · v2 · F 模型 + 一组资源绑
       · 段 2: 组级判定（F1~F4 + G1/G2 + 决策矩阵）→ trans_data.group_verdict / group_verdict_decision
       · 段 3: 元数据+DNS 精确清理（非 GROUP_RECYCLE 自动 no-op）→ trans_data.pending_clear_ips
       · 段 4: 机器脚本清理（空则 no-op）
-  - 与 v1 的 :class:`MySQLHAApplyRevokeFlow` 差异：
-      * 判定用 F1~F4 三态判据 + G1/G2 组级判据 + 8 格决策矩阵，边界清晰、可穷举
-      * 判定与清理解耦，中间不引入 Pause 节点，时效性有保障
-      * 每组独立处理（一组挂起不影响其他组自动退回）
-      * 判定框架完全通用（后续 Single / TenDBCluster 只需替换 Extractor 即可复用）
-
 设计要点：
   - **顶层 try/except 兜底**：任何未处理异常 → 记 ERROR 日志 + 空 recycle_hosts 结束，
-    避免阻塞 RECYCLE_APPLY_HOST 主单据（需求 9.4）
-  - **接入版本标识日志**：入口打印 ``revoke_version=v2 ...`` 便于灰度期回溯（需求 9.3）
+    避免阻塞 RECYCLE_APPLY_HOST 主单据
 """
 import logging
 import traceback
@@ -44,9 +37,6 @@ from backend.flow.engine.revoke.models import ResourceGroup
 from backend.flow.engine.revoke.trans_data import RevokeTransData
 
 logger = logging.getLogger("flow")
-
-#: 接入版本标识：便于灰度期通过日志检索走 v1 / v2 分支的单据
-_REVOKE_VERSION: str = "v2"
 
 
 class MysqlHaApplyRevokeFlow(RevokeFlowBase):
@@ -73,9 +63,6 @@ class MysqlHaApplyRevokeFlow(RevokeFlowBase):
     #: 日志前缀：子类覆盖以在日志中区分单据类型（HA / Single / Cluster）
     _LOG_PREFIX: str = "MysqlHaApplyRevokeFlow"
 
-    #: revoke 接入类型标识：便于灰度期通过日志检索区分不同类型部署单据的 revoke 走向
-    _REVOKE_KIND: str = "ha"
-
     def revoke_flow(self) -> None:
         """执行 revoke 主链路：Extractor → 每组编排「4 段合并子流程」→ 并行运行。
 
@@ -86,41 +73,21 @@ class MysqlHaApplyRevokeFlow(RevokeFlowBase):
         try:
             self._do_revoke_flow()
         except Exception as err:
-            logger.error(
+            raise Exception(
                 "[{}][{}] revoke_flow unexpected error: {}\n{}".format(
                     self._LOG_PREFIX, self.root_id, err, traceback.format_exc(limit=5)
                 )
             )
-            # 顶层兜底：不抛出，让 RECYCLE_APPLY_HOST 主单据继续走"无回收主机则 SKIPPED"路径
 
     def _do_revoke_flow(self) -> None:
         """真正执行 revoke 编排。异常由顶层 revoke_flow 兜底捕获。"""
-        ticket_id: int = int(self.data.get("uid") or self.data.get("ticket_id") or 0)
-        bk_biz_id: int = int(self.data.get("bk_biz_id") or 0)
-
-        logger.info(
-            "[{}][{}] revoke_version={} revoke_kind={} ticket_id={} bk_biz_id={} entering".format(
-                self._LOG_PREFIX, self.root_id, _REVOKE_VERSION, self._REVOKE_KIND, ticket_id, bk_biz_id
-            )
-        )
+        ticket_id: int = int(self.data["uid"])
+        bk_biz_id: int = int(self.data["bk_biz_id"])
 
         # ---- 1. Extractor 提取候选资源组 ----
         groups: List[ResourceGroup] = self.EXTRACTOR_CLASS().extract(self.data)
         if not groups:
-            logger.info(
-                "[{}][{}] revoke_version={} revoke_kind={} ticket_id={} no candidate group, exit".format(
-                    self._LOG_PREFIX, self.root_id, _REVOKE_VERSION, self._REVOKE_KIND, ticket_id
-                )
-            )
-            # 依然启动一个空 pipeline 以便下游从 trans_data.recycle_hosts 取到空列表
-            self._run_empty_pipeline()
-            return
-
-        logger.info(
-            "[{}][{}] revoke_version={} revoke_kind={} ticket_id={} groups_count={} extracted".format(
-                self._LOG_PREFIX, self.root_id, _REVOKE_VERSION, self._REVOKE_KIND, ticket_id, len(groups)
-            )
-        )
+            raise Exception(_("单据获取不到对应的申请资源组"))
 
         # ---- 2. 顶层 pipeline 并行编排每组的合并子流程 ----
         # 关键字段说明：
@@ -134,7 +101,7 @@ class MysqlHaApplyRevokeFlow(RevokeFlowBase):
             "uid": ticket_id,
             "bk_biz_id": bk_biz_id,
             "ticket_type": self.data["ticket_type"],
-            "created_by": self.data.get("created_by") or self.data.get("operator") or "",
+            "created_by": self.data.get("created_by"),
             "db_type": DBType.MySQL.value,
             "os_type": BkOsTypeCode.LINUX.value,
         }
@@ -157,42 +124,5 @@ class MysqlHaApplyRevokeFlow(RevokeFlowBase):
 
         top_pipeline.add_parallel_sub_pipeline(sub_flow_list=group_sub_pipelines)
 
-        logger.info(
-            "[{}][{}] revoke_version={} revoke_kind={} launching pipeline with {} groups".format(
-                self._LOG_PREFIX, self.root_id, _REVOKE_VERSION, self._REVOKE_KIND, len(groups)
-            )
-        )
-        # 关键：显式注入 RevokeTransData 作为 trans_data 初值；否则子流程内
-        # setattr(trans_data, dynamic_key, value) 会在 trans_data 为 None 时抛 AttributeError
-        top_pipeline.run_pipeline(init_trans_data_class=RevokeTransData())
-
-    def _run_empty_pipeline(self) -> None:
-        """无候选组时启动一个仅包含空 recycle_hosts 的最小 pipeline。
-
-        目的：即使无候选组，也需要让 CalcRecycleApplyHostParamBuilder.post_callback 拿到
-        ``trans_data.recycle_hosts=[]`` 走"无回收主机则后续 flow SKIPPED"逻辑。
-
-        :return: None
-        """
-        # 最简单实现：直接 return 不 run。CalcRecycleApplyHostParamBuilder.post_callback 里
-        # 通过 self.ticket.current_flow().output_data 取值；如果 flow 没有输出会走 AppBaseException
-        # 分支，进而调用 BaseTicketFlow.run_error_status_handler。
-        # 但对"合法但空"的场景我们期望直接走"后续 flow SKIPPED"分支，因此至少需要一次 run_pipeline。
-        # 用一个空活动节点占位即可。
-        from backend.flow.plugins.components.collections.common.empty_node import EmptyNodeComponent
-
-        global_data: Dict[str, Any] = {
-            "uid": int(self.data.get("uid") or 0),
-            "bk_biz_id": int(self.data.get("bk_biz_id") or 0),
-            # FlowTree 强依赖字段：从 ticket_data 透传，否则 Builder.run_pipeline 会 KeyError
-            "ticket_type": self.data["ticket_type"],
-            "created_by": self.data.get("created_by") or self.data.get("operator") or "",
-        }
-        top_pipeline = Builder(root_id=self.root_id, data=global_data)
-        top_pipeline.add_act(
-            act_name=_("无候选资源组 · 空回收"),
-            act_component_code=EmptyNodeComponent.code,
-            kwargs={},
-        )
-        # 与主分支保持一致：显式注入 RevokeTransData 作为 trans_data 初值
+        # 关键：显式注入 RevokeTransData 作为 trans_data 初值
         top_pipeline.run_pipeline(init_trans_data_class=RevokeTransData())

@@ -12,19 +12,19 @@ TenDBSingle 部署单据主机退回顶层编排 · v2 · F 模型 + 一台一�
 
 模块职责：
   - 承担 `MYSQL_SINGLE_APPLY` 单据 TERMINATED 后的主机退回顶层入口
-  - 复用 HA v2 编排骨架（`MysqlHaApplyRevokeFlow._do_revoke_flow` / `_build_one_group_pipeline` /
-    `_run_empty_pipeline`），仅通过覆盖 Extractor 类与日志标识完成 Single 场景接入
+  - 复用 HA v2 编排骨架（`MysqlHaApplyRevokeFlow._do_revoke_flow`），
+    仅通过覆盖 Extractor 类与日志标识完成 Single 场景接入
 
 设计要点：
-  - **零代码复制**：继承 HA v2 类，仅覆盖 3 个类属性（`EXTRACTOR_CLASS` / `_LOG_PREFIX` / `_REVOKE_KIND`），
-    编排逻辑（Extractor 提取 → 每组合并子流程 → 并行执行 → 空组 empty pipeline）完全通过 super() 复用
-  - **Single 场景特性**：一组资源固定 1 台机器（承载 M 个 Single 集群实例）；G1 天然一致、
-    G2 天然不适用；判定核心（F1~F4）/ 决策矩阵 / 组决策 / 清理段全部与 HA 共用同一套代码
+  - **零代码复制**：继承 HA v2 类，仅覆盖 2 个类属性（`EXTRACTOR_CLASS` / `_LOG_PREFIX`），
+    编排逻辑（Extractor 提取 → 每组合并子流程 → 并行执行）完全通过 super() 复用
+  - **Single 场景特性**：一组资源固定 1 台机器（承载 M 个 Single 集群实例）；G1 天然一致；
+    判定核心（F1~F4）/ 决策矩阵 / 组决策 / 清理段全部与 HA 共用同一套代码
   - **集群元数据清理分派**：由 `group_cleanup.py._cleanup_cluster_meta` 按 `Cluster.cluster_type`
     分派到 `TenDBSingleClusterHandler.decommission`，本类无需关心
 
 模块边界：
-  - ticket_data 缺 apply_infos → Extractor 返回 [] → 走 empty pipeline 分支
+  - ticket_data 缺 apply_infos → Extractor 返回 [] → 由 HA v2 _do_revoke_flow 抛 Exception 挂起上报
   - 顶层异常兜底完全继承自 HA v2 类的 `revoke_flow` try/except
 """
 from backend.flow.engine.bamboo.scene.mysql.revoke.mysql_ha_apply_revoke_flow_v2 import MysqlHaApplyRevokeFlow
@@ -53,6 +53,3 @@ class MysqlSingleApplyRevokeFlow(MysqlHaApplyRevokeFlow):
 
     #: 日志前缀：区分 Single 场景日志
     _LOG_PREFIX: str = "MysqlSingleApplyRevokeFlow"
-
-    #: revoke 接入类型标识：便于灰度期日志检索
-    _REVOKE_KIND: str = "single"

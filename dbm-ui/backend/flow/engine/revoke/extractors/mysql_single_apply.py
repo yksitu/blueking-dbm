@@ -19,24 +19,25 @@ TenDBSingle 部署单据 · 候选主机 Extractor。
 设计参考：
   - ``backend/flow/engine/bamboo/scene/mysql/mysql_single_apply_flow.py`` 的 ``deploy_mysql_single_flow``
   - 每 apply_info 对应 1 台 single 机器 + M 个 Single 集群实例，作为一个 ResourceGroup
-  - 一组一台，组间独立并行；G1（组内一致性）单元素天然成立，G2（集群架构完整性）不适用
+  - 一组一台，组间独立并行；G1（组内一致性）单元素天然成立
 
 模块边界：
-  - ticket_data 缺关键字段 -> 返回 []，记 ERROR 日志
-  - apply_infos 为空列表 -> 返回 []（正常场景）
-  - 单个 apply_info 内 new_ip / clusters 缺失或非法 -> 跳过该 apply_info 并记 ERROR
+  - ticket_data 关键字段缺失 / 类型非法 -> 直接抛 :class:`NormalTenDBFlowException`，
+    由上层 ``revoke_flow`` 顶层 try/except 统一兜底并短路整个 revoke 流程
+  - apply_infos 为空列表 -> 返回 []（正常场景，允许无候选组）
 """
-import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from backend.db_meta.enums import ClusterType
+from backend.flow.engine.bamboo.scene.mysql.common.exceptions import NormalTenDBFlowException
 from backend.flow.engine.revoke.extractors.base import ApplyHostExtractor
 from backend.flow.engine.revoke.models import ResourceGroup, RevokeUnit
 
-logger = logging.getLogger("flow")
-
 #: role 常量：与 ResourceGroup.get_master_units() 契约保持一致（"single" 属于 master 类角色，不属于 proxy 类）
 ROLE_SINGLE: str = "single"
+
+#: 日志/异常前缀：便于在 revoke_flow 顶层兜底日志中快速定位来源
+_ERR_PREFIX: str = "[MysqlSingleApplyExtractor]"
 
 
 class MysqlSingleApplyExtractor(ApplyHostExtractor):
@@ -54,30 +55,31 @@ class MysqlSingleApplyExtractor(ApplyHostExtractor):
 
     线程安全：是（无实例状态）
     边界：
-      - ticket_data 类型非 dict / 缺 apply_infos -> 记 ERROR 返回 []
-      - 单个 apply_info 缺关键字段（new_ip / clusters）-> 跳过该组，其他 apply_info 正常处理
-      - actual_inst_count <= 0 -> 跳过该组（clusters 空或 inst_num <= 0）
+      - ticket_data 类型非 dict / 关键字段（apply_infos / start_mysql_port /
+        inst_num / bk_biz_id）缺失或类型非法 -> 抛 :class:`NormalTenDBFlowException`
+      - 单个 apply_info 缺关键字段（new_ip / clusters）或 actual_inst_count <= 0
+        -> 抛 :class:`NormalTenDBFlowException`
+      - 异常一律由上层 ``revoke_flow`` 顶层 try/except 统一兜底，本类不做局部吞异常
     """
 
     def extract(self, ticket_data: Dict) -> List[ResourceGroup]:
         """从 TenDBSingle 部署单据 ticket_data 提取候选组列表。
 
         :param ticket_data: MYSQL_SINGLE_APPLY 单据的 flow ticket_data
-        :return: List[ResourceGroup]；解析失败或空列表返回 []
-        边界见类 docstring
+        :return: List[ResourceGroup]；apply_infos 为空列表时返回 []
+        边界：解析失败一律 raise :class:`NormalTenDBFlowException`，
+              由上层 revoke_flow 顶层 try/except 兜底
         """
         if not isinstance(ticket_data, dict):
-            logger.error(
-                "[MysqlSingleApplyExtractor] ticket_data is not dict: type={}".format(type(ticket_data).__name__)
+            raise NormalTenDBFlowException(
+                message="{} ticket_data is not dict: type={}".format(_ERR_PREFIX, type(ticket_data).__name__)
             )
-            return []
 
         apply_infos = ticket_data.get("apply_infos")
         if not isinstance(apply_infos, list):
-            logger.error(
-                "[MysqlSingleApplyExtractor] ticket_data.apply_infos missing or not list: {!r}".format(apply_infos)
+            raise NormalTenDBFlowException(
+                message="{} ticket_data.apply_infos missing or not list: {!r}".format(_ERR_PREFIX, apply_infos)
             )
-            return []
 
         start_mysql_port = ticket_data.get("start_mysql_port")
         inst_num = ticket_data.get("inst_num")
@@ -89,8 +91,7 @@ class MysqlSingleApplyExtractor(ApplyHostExtractor):
             inst_num_i: int = int(inst_num)
             bk_biz_id_i: int = int(bk_biz_id)
         except (TypeError, ValueError) as err:
-            logger.error("[MysqlSingleApplyExtractor] ticket_data field types illegal: {}".format(err))
-            return []
+            raise NormalTenDBFlowException(message="{} ticket_data field types illegal: {}".format(_ERR_PREFIX, err))
 
         groups: List[ResourceGroup] = []
         for idx, info in enumerate(apply_infos):
@@ -101,8 +102,7 @@ class MysqlSingleApplyExtractor(ApplyHostExtractor):
                 inst_num=inst_num_i,
                 bk_biz_id=bk_biz_id_i,
             )
-            if group is not None:
-                groups.append(group)
+            groups.append(group)
         return groups
 
     def _extract_one_apply_info(
@@ -112,7 +112,7 @@ class MysqlSingleApplyExtractor(ApplyHostExtractor):
         start_mysql_port: int,
         inst_num: int,
         bk_biz_id: int,
-    ) -> Optional[ResourceGroup]:
+    ) -> ResourceGroup:
         """处理一个 apply_info，产出 ResourceGroup。
 
         :param apply_info: 单个 apply_info 字典，形如 {"new_ip": {...}, "clusters": [...]}
@@ -120,43 +120,41 @@ class MysqlSingleApplyExtractor(ApplyHostExtractor):
         :param start_mysql_port: ticket_data.start_mysql_port
         :param inst_num: ticket_data.inst_num
         :param bk_biz_id: 业务 id
-        :return: :class:`ResourceGroup`；关键字段缺失时返回 None
+        :return: :class:`ResourceGroup`
         边界：
-          - new_ip 非 dict 或缺 ip/bk_host_id -> None
-          - clusters 非 list 或空 -> None
-          - actual_inst_count <= 0 -> None
+          - apply_info 类型非 dict -> 抛 :class:`NormalTenDBFlowException`
+          - new_ip 非 dict 或缺 ip/bk_host_id -> 抛 :class:`NormalTenDBFlowException`
+          - clusters 非 list 或空 -> 抛 :class:`NormalTenDBFlowException`
+          - actual_inst_count <= 0 -> 抛 :class:`NormalTenDBFlowException`
+          - RevokeUnit 构造字段类型非法 -> 抛 :class:`NormalTenDBFlowException`
         """
         if not isinstance(apply_info, dict):
-            logger.error(
-                "[MysqlSingleApplyExtractor] apply_infos[{}] is not dict: {!r}".format(apply_info_idx, apply_info)
+            raise NormalTenDBFlowException(
+                message="{} apply_infos[{}] is not dict: {!r}".format(_ERR_PREFIX, apply_info_idx, apply_info)
             )
-            return None
 
         new_ip = apply_info.get("new_ip")
         clusters = apply_info.get("clusters") or []
 
         if not isinstance(new_ip, dict) or "ip" not in new_ip or "bk_host_id" not in new_ip:
-            logger.error(
-                "[MysqlSingleApplyExtractor] apply_infos[{}].new_ip missing ip/bk_host_id: {!r}".format(
-                    apply_info_idx, new_ip
+            raise NormalTenDBFlowException(
+                message="{} apply_infos[{}].new_ip missing ip/bk_host_id: {!r}".format(
+                    _ERR_PREFIX, apply_info_idx, new_ip
                 )
             )
-            return None
         if not isinstance(clusters, list) or not clusters:
-            logger.error(
-                "[MysqlSingleApplyExtractor] apply_infos[{}].clusters empty or non-list".format(apply_info_idx)
+            raise NormalTenDBFlowException(
+                message="{} apply_infos[{}].clusters empty or non-list".format(_ERR_PREFIX, apply_info_idx)
             )
-            return None
 
         # 计算实际部署端口数量（与 mysql_single_apply_flow.py 的 __calc_install_ports 完全对齐）
         actual_inst_count: int = min(inst_num, len(clusters))
         if actual_inst_count <= 0:
-            logger.error(
-                "[MysqlSingleApplyExtractor] apply_infos[{}] actual_inst_count <= 0 (inst_num={} clusters={})".format(
-                    apply_info_idx, inst_num, len(clusters)
+            raise NormalTenDBFlowException(
+                message="{} apply_infos[{}] actual_inst_count <= 0 (inst_num={} clusters={})".format(
+                    _ERR_PREFIX, apply_info_idx, inst_num, len(clusters)
                 )
             )
-            return None
 
         mysql_ports: Tuple[int, ...] = tuple(start_mysql_port + i for i in range(actual_inst_count))
 
@@ -178,18 +176,12 @@ class MysqlSingleApplyExtractor(ApplyHostExtractor):
                 bk_biz_id=bk_biz_id,
                 role=ROLE_SINGLE,
                 expected_ports=mysql_ports,
-                expected_admin_ports=tuple(),  # Single 无 proxy 层，无 admin 端口
-                expected_domains=cluster_domains,  # Single 只绑主域名
-                expected_cluster_domains=cluster_domains,
                 cluster_type=ClusterType.TenDBSingle.value,
             )
         except (TypeError, ValueError) as err:
-            logger.error(
-                "[MysqlSingleApplyExtractor] apply_infos[{}].new_ip field types illegal: {}".format(
-                    apply_info_idx, err
-                )
+            raise NormalTenDBFlowException(
+                message="{} apply_infos[{}].new_ip field types illegal: {}".format(_ERR_PREFIX, apply_info_idx, err)
             )
-            return None
 
         # ---- 装配 group_id + context ----
         group_id: str = "apply_info_{}".format(apply_info_idx)

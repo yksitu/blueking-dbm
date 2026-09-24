@@ -11,12 +11,10 @@ specific language governing permissions and limitations under the License.
 主机退回资源池 · 清理子流程 bamboo Service / Component。
 
 模块职责：
-  - :class:`ResourceGroupCleanupService` · 元数据+DNS 精确清理（按 evidence）
+  - :class:`ResourceGroupCleanupService` · 元数据精确清理（按 evidence · 仅 host 相关）
       * 非 GROUP_RECYCLE 结论直接 no-op 结束
       * GROUP_RECYCLE 结论：
-        - 按 evidence.f2_traffic.f2a_dns 摘除 DNS 记录（本单端口 + 本机 IP）
         - 按 evidence.f3_dbm_residue.tuples 清 StorageInstanceTuple
-        - 按 group.cluster_domains 循环清集群元数据（按 cluster_type 分派到 TenDBHA/TenDBSingle handler）
         - 按 evidence.f3_dbm_residue.machine/storages/proxies 清 Machine 元数据
         - 把 F4=YES 的机器 IP 写入 ``trans_data.pending_clear_ips``
         - 本组已清理机器通过 :class:`FlowOutputHandler(RecycleOutputContext.ToResourceSerializer)`
@@ -29,29 +27,29 @@ specific language governing permissions and limitations under the License.
 
 设计要点：
   - **判据 evidence = 清理清单**：判据里有什么才清什么，不做无差别清理
+  - **只清 host 相关元数据**：revoke_flow 的语义是"退回本单申领的机器"，不是"下线集群"。
+    Cluster / ClusterEntry 等集群维度元数据的生命周期归属于独立的 destroy_flow；
+    在替换类 / 扩容类单据场景下，集群本身还需承载其他机器，绝不能在 revoke 阶段删。
+  - **DNS 摘除不在 cleanup 阶段做**：F2.a 已将"DNS 有任何本机记录"作为红线拦下（
+    命中则 verdict=KEEP/MANUAL，不会进入 cleanup）；到 cleanup 的机器 DNS 层自己就是干净的
   - **元数据清理直接调 DB 层 API**（不走 bamboo 组件），因为这些是 python 层的同步操作，
     放在同一 Service 内可保证事务性和错误处理一致
-  - **DNS 摘除也直接调 DnsApi**（DnsApi 是同步 HTTP，无需异步轮询）
   - **机器脚本下发必须走 Job API 异步**，所以拆一个专用组件复用 ClearMachineScriptService
   - **静态字段名**：与 :class:`RevokeTransData` 预声明字段一一对应；SubProcess 隔离保证组间无冲突
 """
 import logging
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 from django.utils.translation import gettext as _
 from pipeline.component_framework.component import Component
 
-from backend.db_meta.api.cluster.tendbha.handler import TenDBHAClusterHandler
-from backend.db_meta.api.cluster.tendbsingle.handler import TenDBSingleClusterHandler
-from backend.db_meta.enums import ClusterType
-from backend.db_meta.models import Cluster, StorageInstanceTuple
+from backend.db_meta.models import StorageInstanceTuple
 from backend.flow.consts import DBA_ROOT_USER
 from backend.flow.engine.bamboo.scene.common.machine_os_init import RecycleOutputContext
 from backend.flow.engine.revoke.log_utils import group_decision_zh
 from backend.flow.plugins.components.collections.common.base_service import BaseService
 from backend.flow.plugins.components.collections.common.exec_clear_machine import ClearMachineScriptService
 from backend.flow.utils.base.flow_output import FlowOutputHandler
-from backend.flow.utils.dns_manage import DnsManage
 
 logger = logging.getLogger("flow")
 
@@ -60,11 +58,12 @@ _GROUP_RECYCLE_VALUE: str = "group_recycle"
 
 
 class ResourceGroupCleanupService(BaseService):
-    """组级 · 元数据 + DNS 精确清理 Service。
+    """组级 · 元数据精确清理 Service。
 
     kwargs 契约（上层建节点时必须传入）：
       - ``bk_biz_id``         (int, 必填)  业务 id
-      - ``cluster_domains``   (list[str], 必填)  本组承载的集群主域名列表
+      - ``cluster_domains``   (list[str], 可选)  本组承载的集群主域名列表（仅用于日志展示，
+        表明"本组机器归属哪些集群"；**不参与清理动作**，集群元数据由独立 destroy_flow 管理）
       - ``ips_display``       (str, 可选)  组内 IP 列表字符串（供日志主标识用；
         由 :func:`format_group_ips` 生成，与 act_name 保持一致）
 
@@ -90,7 +89,7 @@ class ResourceGroupCleanupService(BaseService):
     """
 
     def _execute(self, data, parent_data) -> bool:
-        """按 group_verdict evidence 精确清理元数据 + DNS。
+        """按 group_verdict evidence 精确清理元数据。
 
         :param data: bamboo 节点数据对象
         :param parent_data: bamboo 父节点数据对象（不使用）
@@ -175,9 +174,10 @@ class ResourceGroupCleanupService(BaseService):
                         }
                     )
 
-            # ---- 3. 清理集群维度元数据（按每个 cluster_domain 调 handler.decommission）----
-            for domain in cluster_domains:
-                self._cleanup_cluster_meta(domain=domain, bk_biz_id=bk_biz_id, node_name=node_name)
+            # ---- 集群维度元数据清理：不在 revoke_flow 职责范围内 ----
+            # revoke_flow 的语义是"退回本单申领的机器"，仅清理 host 相关元数据（Machine / StorageInstanceTuple）。
+            # Cluster / ClusterEntry 的生命周期归属独立的 destroy_flow；替换类 / 扩容类单据下集群仍需承载其他机器，
+            # 绝不能在此阶段删除集群维度元数据。若发现孤儿 Cluster 需 DBA 检查后走 destroy_flow 处置。
 
         except Exception as err:
             self.log_error(
@@ -226,36 +226,21 @@ class ResourceGroupCleanupService(BaseService):
         return True
 
     def _cleanup_one_host(self, verdict_dict: Dict[str, Any], node_name: str) -> None:
-        """清理一台机器的 F2/F3 类残留（DNS + StorageInstanceTuple + Machine 元数据）。
+        """清理一台机器的 F3 类残留（StorageInstanceTuple + Machine 元数据）。
 
         :param verdict_dict: 单机 verdict dict（asdict 序列化的 RevokeVerdict）
         :param node_name: 日志前缀节点名
         :return: None
         边界：
           - 任一清理步失败会 raise 到上层，由上层做组决策改判
+          - DNS 摘除：F2.a 已作为"DNS 有任何记录即红线 YES"的关卡；能走到本方法的机器
+            意味着 F2.a=NO（DNS 上没有本机记录），故 cleanup 阶段不再做 DNS 摘除
         """
         unit = verdict_dict.get("unit") or {}
         facts = verdict_dict.get("facts") or {}
         ip: str = unit.get("ip") or ""
         bk_host_id: int = int(unit.get("bk_host_id") or 0)
         bk_cloud_id: int = int(unit.get("bk_cloud_id") or 0)
-        bk_biz_id: int = int(unit.get("bk_biz_id") or 0)
-        expected_ports: List[int] = list(unit.get("expected_ports") or [])
-        expected_domains: List[str] = list(unit.get("expected_domains") or [])
-
-        # ---- F2.a DNS 摘除 ----
-        f2a = ((facts.get("f2_traffic") or {}).get("evidence") or {}).get("f2a_dns") or {}
-        matched_records = f2a.get("matched_records") or []
-        if matched_records:
-            self._recycle_dns_records(
-                ip=ip,
-                bk_biz_id=bk_biz_id,
-                bk_cloud_id=bk_cloud_id,
-                expected_ports=expected_ports,
-                expected_domains=expected_domains,
-                matched_records=matched_records,
-                node_name=node_name,
-            )
 
         # ---- F3.c StorageInstanceTuple 清理 ----
         tuples: List[Dict[str, Any]] = ((facts.get("f3_dbm_residue") or {}).get("evidence") or {}).get("tuples") or []
@@ -272,67 +257,6 @@ class ResourceGroupCleanupService(BaseService):
         has_proxies = bool(f3_ev.get("proxies"))
         if has_machine or has_storages or has_proxies:
             self._clear_machine_meta(bk_host_id=bk_host_id, ip=ip, bk_cloud_id=bk_cloud_id, node_name=node_name)
-
-    def _recycle_dns_records(
-        self,
-        ip: str,
-        bk_biz_id: int,
-        bk_cloud_id: int,
-        expected_ports: List[int],
-        expected_domains: List[str],
-        matched_records: List[Dict[str, Any]],
-        node_name: str,
-    ) -> None:
-        """摘除本机 IP + 本单端口对应的 DNS 记录。
-
-        怎么做：
-          - 按 F2.a evidence.matched_records 里的 (domain, port) 逐条摘除
-          - 只摘除 domain ∈ expected_domains 且 port ∈ expected_ports 的记录
-          - 使用 :class:`DnsManage` 的 recycle_domain_record 入口，与老实现一致
-
-        :param ip: 主机 IP
-        :param bk_biz_id: 业务 id，DnsManage 初始化必需
-        :param bk_cloud_id: 云区域
-        :param expected_ports: 本单端口列表（用于按 port 过滤 DNS 记录）
-        :param expected_domains: 本单预期域名列表
-        :param matched_records: 从 F2.a evidence 拿到的命中记录（每项含 domain_name / port）
-        :param node_name: 日志前缀
-        :return: None
-        边界：
-          - DnsApi 异常 -> raise 到上层
-          - 无匹配的 (domain, port) 组合 -> 直接跳过，不发起 API
-        """
-        expected_ports_set: Set[int] = set(expected_ports)
-        expected_domains_set: Set[str] = set(expected_domains)
-
-        del_instance_list: List[str] = []
-        matched_pairs: List[str] = []
-        for rec in matched_records:
-            domain: str = rec.get("domain_name") or ""
-            port_val = rec.get("port")
-            if domain not in expected_domains_set:
-                continue
-            try:
-                port_int: int = int(port_val)
-            except (TypeError, ValueError):
-                continue
-            if port_int not in expected_ports_set:
-                continue
-            del_instance_list.append("{}#{}".format(ip, port_int))
-            matched_pairs.append("{}#{}@{}".format(ip, port_int, domain))
-
-        if not del_instance_list:
-            self.log_info(_("[{}] ip={} 无 DNS 记录需摘除").format(node_name, ip))
-            return
-
-        # 去重（同 ip#port 若被多域名解析引用只需摘一次）
-        del_instance_list = sorted(set(del_instance_list))
-        DnsManage(bk_biz_id=bk_biz_id, bk_cloud_id=bk_cloud_id).recycle_domain_record(
-            del_instance_list=del_instance_list
-        )
-        self.log_info(
-            _("[{}] 摘除 DNS ip={} instances={} pairs={}").format(node_name, ip, del_instance_list, matched_pairs)
-        )
 
     def _clear_machine_meta(self, bk_host_id: int, ip: str, bk_cloud_id: int, node_name: str) -> None:
         """清理一台机器的 Machine + 实例元数据。
@@ -355,54 +279,9 @@ class ResourceGroupCleanupService(BaseService):
         )
         self.log_info(_("[{}] 清 Machine 元数据 ip={} bk_host_id={}").format(node_name, ip, bk_host_id))
 
-    def _cleanup_cluster_meta(self, domain: str, bk_biz_id: int, node_name: str) -> None:
-        """清理集群维度元数据（TenDBHAClusterHandler.decommission）。
-
-        与 :meth:`MySQLDBMeta.mysql_ha_destroy_for_revoke` 等价。
-
-        :param domain: 集群主域名
-        :param bk_biz_id: 业务 id
-        :param node_name: 日志前缀
-        :return: None
-        边界：
-          - Cluster 不存在 -> 记 INFO 日志跳过（可能是 F3.b 命中的是软状态或已被别的组清过）
-          - 底层 decommission 异常 -> raise 到上层
-        """
-        try:
-            cluster = Cluster.objects.get(immute_domain=domain, bk_biz_id=bk_biz_id)
-        except Cluster.DoesNotExist:
-            self.log_info(_("[{}] Cluster domain={} 已不存在，跳过").format(node_name, domain))
-            return
-
-        # 按 cluster_type 分派到对应集群 handler：
-        #   * TenDBHA    -> TenDBHAClusterHandler.decommission
-        #   * TenDBSingle -> TenDBSingleClusterHandler.decommission
-        #   * 其他（含 TenDBCluster）→ 本次范围不处理，记 INFO 日志跳过
-        if cluster.cluster_type == ClusterType.TenDBHA.value:
-            self.log_info(
-                _("[{}] 集群元数据清理分派 branch=TenDBHA domain={} cluster_id={}").format(node_name, domain, cluster.id)
-            )
-            TenDBHAClusterHandler(bk_biz_id=cluster.bk_biz_id, cluster_id=cluster.id).decommission()
-            self.log_info(_("[{}] 清集群元数据 domain={} cluster_id={}").format(node_name, domain, cluster.id))
-            return
-
-        if cluster.cluster_type == ClusterType.TenDBSingle.value:
-            self.log_info(
-                _("[{}] 集群元数据清理分派 branch=TenDBSingle domain={} cluster_id={}").format(node_name, domain, cluster.id)
-            )
-            TenDBSingleClusterHandler(bk_biz_id=cluster.bk_biz_id, cluster_id=cluster.id).decommission()
-            self.log_info(_("[{}] 清集群元数据 domain={} cluster_id={}").format(node_name, domain, cluster.id))
-            return
-
-        self.log_info(
-            _("[{}] 集群元数据清理分派 branch=skipped domain={} type={} 非 TenDBHA/TenDBSingle，跳过").format(
-                node_name, domain, cluster.cluster_type
-            )
-        )
-
 
 class ResourceGroupCleanupComponent(Component):
-    """组级 · 元数据 + DNS 精确清理 bamboo 组件。"""
+    """组级 · 元数据精确清理 bamboo 组件。"""
 
     name = __name__
     code = "resource_group_cleanup"

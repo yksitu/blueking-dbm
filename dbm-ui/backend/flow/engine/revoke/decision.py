@@ -161,14 +161,14 @@ class HostDecisionMatrix:
 
 
 class GroupDecisionMatrix:
-    """组级决策矩阵 · G1 + G2 + 组内单机结论 → GROUP_*。
+    """组级决策矩阵 · G1 + 组内单机结论 → GROUP_*。
 
     职责：
-      - 严格按需求文档"组决策判断表 · 表 4"的 8 行组合产出组结论
+      - 严格按需求文档"组决策判断表 · 表 4"的组合产出组结论
       - 组挂起（GROUP_MANUAL）时 reason 携带完整挂起原因文本
 
     使用方式：
-        gv = GroupDecisionMatrix.classify(group, verdicts, g1, g2)
+        gv = GroupDecisionMatrix.classify(group, verdicts, g1)
 
     线程安全：是
     边界：
@@ -181,7 +181,6 @@ class GroupDecisionMatrix:
         group: ResourceGroup,
         verdicts: Tuple[RevokeVerdict, ...],
         g1: FactCheckOutcome,
-        g2: FactCheckOutcome = None,
     ) -> GroupVerdict:
         """按组决策矩阵产出组结论。
 
@@ -189,12 +188,11 @@ class GroupDecisionMatrix:
           1) G1=NO（组内混合结论）→ GROUP_MANUAL
           2) G1=YES 且组内均 SKIP → GROUP_SKIP
           3) G1=YES 且组内均 KEEP → GROUP_KEEP
-          4) G1=YES 且组内均 RECYCLE → 看 G2；G2=NO → GROUP_MANUAL；G2=YES/不适用 → GROUP_RECYCLE
+          4) G1=YES 且组内均 RECYCLE → GROUP_RECYCLE
 
         :param group: 判定所属资源组
         :param verdicts: 组内每台机器的单机 RevokeVerdict（顺序需对应 group.units）
         :param g1: G1 组内一致性判据结果
-        :param g2: G2 集群架构完整性判据结果；不适用场景传 None
         :return: :class:`GroupVerdict`
         边界：
           - g1 类型不匹配 -> GroupVerdict 构造器会 raise
@@ -208,7 +206,6 @@ class GroupDecisionMatrix:
                 decision=GroupDecision.GROUP_MANUAL,
                 verdicts=verdicts,
                 g1=g1,
-                g2=g2,
                 reason="组决策=GROUP_MANUAL：G1=NO 组内单机结论不一致，构成 {}".format(construction),
             )
 
@@ -221,7 +218,6 @@ class GroupDecisionMatrix:
                 decision=GroupDecision.GROUP_SKIP,
                 verdicts=verdicts,
                 g1=g1,
-                g2=g2,
                 reason="组决策=GROUP_SKIP：组内全部机器均为 SKIP，本组不属于本单据",
             )
 
@@ -231,37 +227,16 @@ class GroupDecisionMatrix:
                 decision=GroupDecision.GROUP_KEEP,
                 verdicts=verdicts,
                 g1=g1,
-                g2=g2,
                 reason="组决策=GROUP_KEEP：组内全部机器均为 KEEP，红线保留整组",
             )
 
         if all(d == HostDecision.RECYCLE for d in decisions):
-            # G2 检查：仅当 G2 明确 NO 时挂起；G2=None（不适用）或 g2.state=YES 都放行
-            if g2 is not None and g2.state == FactState.NO:
-                return GroupVerdict(
-                    group=group,
-                    decision=GroupDecision.GROUP_MANUAL,
-                    verdicts=verdicts,
-                    g1=g1,
-                    g2=g2,
-                    reason="组决策=GROUP_MANUAL：G2=NO 集群架构不完整（proxy 后端未指向 backend_master）",
-                )
-            if g2 is not None and g2.state == FactState.UNKNOWN:
-                return GroupVerdict(
-                    group=group,
-                    decision=GroupDecision.GROUP_MANUAL,
-                    verdicts=verdicts,
-                    g1=g1,
-                    g2=g2,
-                    reason="组决策=GROUP_MANUAL：G2=UNKNOWN 无法确认集群架构完整性，保守挂起",
-                )
             return GroupVerdict(
                 group=group,
                 decision=GroupDecision.GROUP_RECYCLE,
                 verdicts=verdicts,
                 g1=g1,
-                g2=g2,
-                reason="组决策=GROUP_RECYCLE：组内全部机器均为 RECYCLE 且 G2 通过（或不适用）",
+                reason="组决策=GROUP_RECYCLE：组内全部机器均为 RECYCLE",
             )
 
         # 兜底（理论不可达：G1=YES 意味着结论一致，上面三种情况已覆盖）
@@ -271,7 +246,6 @@ class GroupDecisionMatrix:
             decision=GroupDecision.GROUP_MANUAL,
             verdicts=verdicts,
             g1=g1,
-            g2=g2,
             reason="组决策=GROUP_MANUAL：G1=YES 但组内结论构成异常 {}，兜底挂起".format(construction),
         )
 
