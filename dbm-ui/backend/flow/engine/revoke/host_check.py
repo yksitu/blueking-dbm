@@ -1088,7 +1088,6 @@ class HostRevokeChecker:
                 error="unit is not RevokeUnit",
                 reason="F3 输入 unit 类型非法",
             )
-        print(unit)
         expected_ports: Tuple[int, ...] = unit.expected_ports
         try:
             # ---- F3.d · Machine ----

@@ -218,6 +218,18 @@ class ResourceGroupJudgeService(BaseService):
             f4 = HostRevokeChecker.check_f4_process(ctx_by_ip.get(u.ip), ip=u.ip)
             facts = HostRevokeFacts(f1_ownership=f1, f2_traffic=f2, f3_dbm_residue=f3, f4_process=f4)
             verdict = HostDecisionMatrix.classify(unit=u, facts=facts)
+
+            # ── F2=YES 时从 evidence 中提取 DNS 域名列表，向 DBA 展示具体命中域名（样式 γ）
+            #    取值路径：f2.evidence["dns"]["domain_names"]，与 host_check._sub_check_f2a_dns 产出结构对齐
+            #    只在 f2.state==YES 且域名非空时展开；F2=NO/UNKNOWN 保持原样（避免日志噪音）
+            f2_dns_lines: str = ""
+            if f2.state.value == "yes" and isinstance(f2.evidence, dict):
+                dns_sub: Dict[str, Any] = f2.evidence.get("dns") or {}
+                domain_names: List[str] = list(dns_sub.get("domain_names") or [])
+                if domain_names:
+                    # 逐行展示，与检测项字段对齐的 └─ 层级前缀，保证视觉层次清晰
+                    f2_dns_lines = "\n" + "\n".join("     └─ DNS 域名: {}".format(d) for d in domain_names)
+
             # ── 单机结论日志：草稿 A 详细版 · 一次 log_info 输出多行，固定格式便于阅读
             #    每台机器一个完整块：横线分隔 + 主机基本信息 + 检测项 4 项 + 判定结果
             self.log_info(
@@ -229,7 +241,7 @@ class ResourceGroupJudgeService(BaseService):
                     "\n"
                     "【检测项】\n"
                     "  ① 是否存在非法移动/重新入池  : {f1_zh}\n"
-                    "  ② 是否绑定 DNS 或 CLB 服务   : {f2_zh}\n"
+                    "  ② 是否绑定 DNS 或 CLB 服务   : {f2_zh}{f2_dns_lines}\n"
                     "  ③ 是否有元数据残留           : {f3_zh}\n"
                     "  ④ 进程是否存活               : {f4_zh}\n"
                     "\n"
@@ -244,6 +256,7 @@ class ResourceGroupJudgeService(BaseService):
                     role=u.role,
                     f1_zh=f1_zh(f1.state.value),
                     f2_zh=f2_zh(f2.state.value),
+                    f2_dns_lines=f2_dns_lines,
                     f3_zh=f3_zh(f3.state.value),
                     f4_zh=f4_zh(f4.state.value),
                     decision_zh=host_decision_zh(verdict.decision.value),
@@ -301,6 +314,9 @@ class ResourceGroupJudgeService(BaseService):
             logger.warning(warning_text)
 
         # ---- 6. 将 GroupVerdict 写入 trans_data（静态字段：SubProcess 隔离保证组间无冲突）----
+        # 无论本节点最终 return True/False，都先完整写入 trans_data：
+        #   * 写入后下游 cleanup Service 依据 group_verdict_decision 自行分支 no-op，不会误动作
+        #   * 写入后 DBA 重试时，后续排查工具仍可读到本次判定上下文（evidence 完整保留）
         try:
             gv_dict: Dict[str, Any] = _group_verdict_to_dict(gv)
             if trans_data is not None:
@@ -309,6 +325,28 @@ class ResourceGroupJudgeService(BaseService):
             data.outputs["trans_data"] = trans_data
         except Exception as err:
             self.log_error(_("[{}] 写入 trans_data 失败: {}").format(node_name, err))
+            return False
+
+        # ---- 7. 方案 A：组决策=GROUP_MANUAL 时节点失败，让 DBA 在 pipeline UI 看到红点并人工确认 ----
+        # 设计意图：
+        #   * GROUP_MANUAL 的语义本就是"不能自动判断该否清理"，需 DBA 介入
+        #   * bamboo 尚未接入独立的 Pause 人工确认节点，目前用 return False 代替：
+        #       - DBA 在 pipeline UI 看到判定节点 FAILED，点开可读到完整的单机日志块 + 组级结论
+        #       - DBA 确认后可选：处置完外部问题后"重试" / 直接"跳过"本节点
+        #   * 该失败不影响已写入的 trans_data（步骤 6 已提前落盘）
+        if gv.decision == GroupDecision.GROUP_MANUAL:
+            self.log_error(
+                _(
+                    "\n{sep}\n"
+                    "本组判定结果为【整组挂起（GROUP_MANUAL）】，节点主动失败供人工确认\n"
+                    "  原因：{reason}\n"
+                    "  处置指引：\n"
+                    "    1) 查看上方单机日志块（标题行含主机 IP），确认具体异常机器\n"
+                    "    2) 外部频道处理异常（如手动摘除 DNS / 确认机器归属 / 手动清理残留进程）\n"
+                    "    3) 处理完后在 pipeline 上点击【重试】本节点；若确认无需回收可直接点击【跳过】\n"
+                    "{sep}"
+                ).format(sep="━" * 60, reason=extract_decision_reason(gv.reason))
+            )
             return False
 
         return True
