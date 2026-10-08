@@ -111,7 +111,8 @@ class ResourceGroupJudgeService(BaseService):
 
     外部落地（本节点在 GROUP_RECYCLE 判决产出瞬间同步执行）：
       - 通过 :class:`FlowOutputHandler(RecycleOutputContext.ToResourceSerializer)` 把本组
-        F3=YES（存在 DBM 元数据残留 → 必然需要被段 3 清理元数据）的机器预申报写入 FlowSummary。
+        **所有 units**（按 ``gv.verdicts`` 全量）预申报写入 FlowSummary；GROUP_RECYCLE 契约
+        保证组内所有机器均需退回资源池，因此不做任何子状态过滤。
       - **语义变更**：FlowSummary 记录的含义由"已完成元数据清理的机器"更新为
         "决策判定需要退回资源池的机器"（预申报语义）。段 3 清理失败挂起时，
         FlowSummary 记录保持不变，由 DBA 原地重试段 3（``_cleanup_one_host`` 幂等）。
@@ -433,12 +434,13 @@ class ResourceGroupJudgeService(BaseService):
             return False
 
     def _pre_declare_flow_summary(self, *, data: Any, gv: GroupVerdict, group: ResourceGroup) -> None:
-        """GROUP_RECYCLE 判决下预申报 FlowSummary（F3=YES 子集）。
+        """GROUP_RECYCLE 判决下预申报 FlowSummary（全量写入本组 units）。
 
         设计意图：
-          - 把 \"决策产出 + 决策副产物（FlowSummary 落地）\" 收敛在同一节点，避免散落到段 3；
-          - 筛选 F3=YES 的机器（存在 DBM 元数据残留 → 必然需要被段 3 清元数据）作为 FlowSummary hosts；
-            语义为 \"决策派发\" 而非 \"清理完成\"。
+          - 把 "决策产出 + 决策副产物（FlowSummary 落地）" 收敛在同一节点，避免散落到段 3；
+          - 按 ``gv.verdicts`` 全量组装 summary_hosts；GROUP_RECYCLE 契约保证组内所有
+            units 均需退回资源池，不做任何子状态过滤（例如不再按 F3 元数据残留筛子集）；
+            语义为 "决策派发" 而非 "清理完成"。
           - 失败策略：insert_data 异常仅记 ERROR + logger.exception，不改判、不 return False；
             判决本身已成功产出，摘要表追加失败走人工兜底。
 
@@ -446,18 +448,17 @@ class ResourceGroupJudgeService(BaseService):
         :param gv: 组决策结果（必须是 GROUP_RECYCLE）
         :param group: 本组资源组（用于日志 group_id）
         """
-        summary_hosts: List[Dict[str, Any]] = []
-        for v in gv.verdicts:
-            # verdict 内部仍是 dataclass（本节点内未序列化），直接访问字段
-            if v.facts.f3_dbm_residue.state.value == "yes":
-                summary_hosts.append(
-                    {
-                        "ip": v.unit.ip,
-                        "bk_host_id": v.unit.bk_host_id,
-                        "bk_cloud_id": v.unit.bk_cloud_id,
-                    }
-                )
+        # GROUP_RECYCLE 契约：verdicts 覆盖本组所有 units，全量写入 FlowSummary
+        summary_hosts: List[Dict[str, Any]] = [
+            {
+                "ip": v.unit.ip,
+                "bk_host_id": v.unit.bk_host_id,
+                "bk_cloud_id": v.unit.bk_cloud_id,
+            }
+            for v in gv.verdicts
+        ]
         if not summary_hosts:
+            # 防御性保护：GroupVerdict.__post_init__ 已校验 verdicts 数量 == group.units 数量，理论不可达
             return
 
         global_data: Dict[str, Any] = data.get_one_of_inputs("global_data") or {}
