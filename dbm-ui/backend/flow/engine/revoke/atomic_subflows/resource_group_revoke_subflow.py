@@ -16,10 +16,12 @@ specific language governing permissions and limitations under the License.
       1) 单 act 下发 :class:`MySQLHostProcessCheckComponent`（多 IP 一次 Job + APPEND 模式），
          产出 ``trans_data.host_process_check`` = ``{ip: <ctx_dict>}``
       2) :class:`ResourceGroupJudgeComponent`：读段 1 + 跑 F1~F4 + G1/G2 + 决策矩阵，
-         产出 ``trans_data.group_verdict`` + ``trans_data.group_verdict_decision``
-      3) :class:`ResourceGroupCleanupComponent`：读段 2 → 精确清元数据 + DNS，
-         产出 ``trans_data.pending_clear_ips`` + 落地 FlowSummary
-      4) :class:`ResourceGroupMachineClearComponent`：读段 3 → Job 下发机器清理脚本
+         产出 ``trans_data.group_verdict`` + ``trans_data.group_verdict_decision``；
+         GROUP_RECYCLE 判决产出瞬间同步写入 FlowSummary（预申报语义，而非清理完成台账）
+      3) :class:`ResourceGroupCleanupComponent`：按 verdict evidence 精确清元数据；
+         不写 trans_data、不写 FlowSummary（职责纯粹化）
+      4) :class:`ResourceGroupMachineClearComponent`：自主基于 ``trans_data.group_verdict``
+         筛选 F4=yes 的 IP 作为 exec_ips，空则 no-op；不再依赖 ``pending_clear_ips`` 字段
 
 设计要点：
   - **合并为单 SubProcess 是必需的**：bamboo SubProcess 之间 ``trans_data`` 无法回写，
@@ -137,9 +139,10 @@ def build_group_revoke_subflow(
         },
     )
 
-    # ---- 段 3：元数据 + DNS 精确清理（非 GROUP_RECYCLE 自动 no-op）----
-    # 段 3 直接读 trans_data.group_verdict / group_verdict_decision，
-    # 写 trans_data.pending_clear_ips，均为 RevokeTransData 静态字段
+    # ---- 段 3：元数据精确清理（非 GROUP_RECYCLE 自动 no-op）----
+    # 段 3 直接读 trans_data.group_verdict / group_verdict_decision；
+    # 本节点不再向 trans_data 写入任何字段，也不再调用 FlowSummary 写入
+    # （FlowSummary 预申报已前移至段 2 Judge；清理失败通过 return False 挂起节点）
     sub_pipeline.add_act(
         act_name=_("元数据清理 [{ips}]").format(ips=ips_display),
         act_component_code=ResourceGroupCleanupComponent.code,
@@ -152,7 +155,7 @@ def build_group_revoke_subflow(
         },
     )
 
-    # ---- 段 4：机器脚本清理（从 trans_data.pending_clear_ips 取 exec_ips；空则 no-op）----
+    # ---- 段 4：机器脚本清理（自主基于 trans_data.group_verdict 筛选 F4=yes 的 IP；空则 no-op）----
     sub_pipeline.add_act(
         act_name=_("机器脚本清理 [{ips}]").format(ips=ips_display),
         act_component_code=ResourceGroupMachineClearComponent.code,

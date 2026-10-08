@@ -61,6 +61,7 @@ from typing import Any, Dict, List, Tuple
 from django.utils.translation import gettext as _
 from pipeline.component_framework.component import Component
 
+from backend.flow.engine.bamboo.scene.common.machine_os_init import RecycleOutputContext
 from backend.flow.engine.revoke.decision import GroupDecisionMatrix, HostDecisionMatrix
 from backend.flow.engine.revoke.group_check import ResourceGroupChecker, build_group_warning_log
 from backend.flow.engine.revoke.host_check import HostRevokeChecker
@@ -83,6 +84,7 @@ from backend.flow.engine.revoke.models import (
     RevokeVerdict,
 )
 from backend.flow.plugins.components.collections.common.base_service import BaseService
+from backend.flow.utils.base.flow_output import FlowOutputHandler
 from backend.ticket.models import Ticket
 
 logger = logging.getLogger("flow")
@@ -106,6 +108,14 @@ class ResourceGroupJudgeService(BaseService):
       - ``group_verdict``            asdict 序列化的 :class:`GroupVerdict` dict
       - ``group_verdict_decision``   :class:`GroupDecision` 的 .value 字符串
         （便于清理子流程分支判断，避免嵌套 dict 取值）
+
+    外部落地（本节点在 GROUP_RECYCLE 判决产出瞬间同步执行）：
+      - 通过 :class:`FlowOutputHandler(RecycleOutputContext.ToResourceSerializer)` 把本组
+        F3=YES（存在 DBM 元数据残留 → 必然需要被段 3 清理元数据）的机器预申报写入 FlowSummary。
+      - **语义变更**：FlowSummary 记录的含义由"已完成元数据清理的机器"更新为
+        "决策判定需要退回资源池的机器"（预申报语义）。段 3 清理失败挂起时，
+        FlowSummary 记录保持不变，由 DBA 原地重试段 3（``_cleanup_one_host`` 幂等）。
+      - 该写入**不改变判决、不阻塞节点**：insert_data 异常仅记 ERROR 日志，继续走后续流程。
 
     判定决策逻辑：
       **F1~F4 单机判据**（含义详见模块级 docstring 首部翻译清单）：
@@ -134,59 +144,115 @@ class ResourceGroupJudgeService(BaseService):
     """
 
     def _execute(self, data, parent_data) -> bool:
-        """执行组级判定汇聚。
+        """执行组级判定汇聚（编排骨架）。
 
-        执行流程（与代码内 ``# ---- N. ... ----`` 段落分隔一一对应）：
-          1. 参数校验与反序列化：把 kwargs.group_dict 兜回 :class:`ResourceGroup`，查出对应 Ticket
-          2. 读取上游进程扫描结果：从 trans_data.host_process_check 取每台机器的进程 <ctx> JSON
-          3. 逐台机器串行跑 F1/F2/F3/F4：产出 :class:`RevokeVerdict` 单机结论
-          4. 组级 G1 判据：组一致性
-          5. 组决策：由决策矩阵产出 :class:`GroupVerdict`；GROUP_MANUAL 时补 WARNING 日志
-          6. 将 GroupVerdict 写回 trans_data：group_verdict + group_verdict_decision 两个字段
+        本方法仅承担\"编排\"职责，按顺序调用 7 个私有方法，不含任何业务分支：
+          1. :meth:`_parse_kwargs`            参数校验 + group / ticket 反序列化
+          2. :meth:`_load_ctx_dict`           读取上游进程扫描 <ctx> dict
+          3. :meth:`_classify_hosts`          逐台机器跑 F1/F2/F3/F4 并产出单机结论
+          4+5. :meth:`_classify_group`        G1 组一致性 + 组决策 + 组级日志 + MANUAL warning
+          6. :meth:`_write_trans_data`        把 GroupVerdict 写回 trans_data
+          6.5. :meth:`_pre_declare_flow_summary` GROUP_RECYCLE 时写 FlowSummary 预申报
+          7. :meth:`_emit_manual_failure_log` GROUP_MANUAL 时输出失败引导日志并 return False
 
         :param data: bamboo 节点数据对象
         :param parent_data: bamboo 父节点数据对象（不使用）
-        :return: True 判定完成；False 表示节点失败（关键字段缺失）
+        :return: True 判定完成；False 表示节点失败（关键字段缺失 / GROUP_MANUAL 主动挂起）
         边界：
-          - 任一关键字段缺失 / 反序列化失败 -> log error 后返回 False，节点失败
-          - 单机 F 判据 / 组级 G1 判据的所有异常均在下层被收敛为 FactState.UNKNOWN，不上抛到本方法
-          - 写 trans_data 异常（理论不可达）-> log error 后返回 False
+          - 任一关键字段缺失 / 反序列化失败 -> 对应子方法 log error 后 return False，节点失败
+          - 单机 F 判据 / 组级 G1 判据的所有异常均在下层收敛为 FactState.UNKNOWN，不上抛到本方法
         """
         kwargs: Dict[str, Any] = data.get_one_of_inputs("kwargs") or {}
         node_name: str = kwargs.get("node_name") or self.__class__.__name__
 
         # ---- 1. 参数校验与反序列化 ----
+        parsed = self._parse_kwargs(kwargs, node_name)
+        if parsed is None:
+            return False
+        group, ticket, root_id, clb_regions = parsed
+        self.log_info(_("开始判定本组 {n} 台主机（单据 {ticket_id}）").format(n=len(group.units), ticket_id=ticket.id))
+
+        # ---- 2. 读取上游进程检查节点写入的组级 <ctx> dict ----
+        trans_data = data.get_one_of_inputs("trans_data")
+        ctx_by_ip = self._load_ctx_dict(trans_data, group, node_name)
+        if ctx_by_ip is None:
+            return False
+
+        # ---- 3. 对每台机器串行跑 F1/F2/F3/F4，产出 RevokeVerdict ----
+        verdicts_tuple = self._classify_hosts(
+            group=group, ticket=ticket, root_id=root_id, clb_regions=clb_regions, ctx_by_ip=ctx_by_ip
+        )
+
+        # ---- 4+5. 组级 G1 判据 + 组决策 + 组级日志 + MANUAL warning ----
+        gv = self._classify_group(group=group, verdicts=verdicts_tuple, root_id=root_id)
+
+        # ---- 6. 将 GroupVerdict 写入 trans_data ----
+        if not self._write_trans_data(data=data, trans_data=trans_data, gv=gv, node_name=node_name):
+            return False
+
+        # ---- 6.5 FlowSummary 预申报写入（仅 GROUP_RECYCLE 触发）----
+        if gv.decision == GroupDecision.GROUP_RECYCLE:
+            self._pre_declare_flow_summary(data=data, gv=gv, group=group)
+
+        # ---- 7. GROUP_MANUAL 时主动失败，供 DBA 在 pipeline UI 人工确认 ----
+        if gv.decision == GroupDecision.GROUP_MANUAL:
+            self._emit_manual_failure_log(gv)
+            return False
+
+        return True
+
+    # ------------------------------------------------------------------
+    # 以下私有方法按 _execute 执行顺序排列，每个方法单一职责，便于单测
+    # ------------------------------------------------------------------
+
+    def _parse_kwargs(
+        self, kwargs: Dict[str, Any], node_name: str
+    ) -> "Tuple[ResourceGroup, Ticket, str, List[str]] | None":
+        """参数校验 + group_dict / ticket 反序列化。
+
+        :param kwargs: bamboo 节点 kwargs
+        :param node_name: 日志前缀用的节点名
+        :return: (group, ticket, root_id, clb_regions) 四元组；校验失败返回 None
+        边界：
+          - group_dict 非 dict / ticket_id 非 int / 反序列化失败 / Ticket 不存在 -> log error 返回 None
+        """
         group_dict = kwargs.get("group_dict")
         ticket_id = kwargs.get("ticket_id")
         clb_regions: List[str] = kwargs.get("clb_regions") or []
 
         if not isinstance(group_dict, dict):
             self.log_error(_("[{}] kwargs.group_dict 缺失或非 dict").format(node_name))
-            return False
+            return None
         if not isinstance(ticket_id, int):
             self.log_error(_("[{}] kwargs.ticket_id 缺失或非 int").format(node_name))
-            return False
+            return None
 
         try:
             group: ResourceGroup = _dict_to_resource_group(group_dict)
         except Exception as err:
             self.log_error(_("[{}] group_dict 反序列化失败: {}").format(node_name, err))
-            return False
+            return None
 
         try:
             ticket: Ticket = Ticket.objects.get(id=ticket_id)
         except Ticket.DoesNotExist:
             self.log_error(_("[{}] 单据 ticket_id={} 不存在").format(node_name, ticket_id))
-            return False
+            return None
 
         root_id: str = kwargs.get("root_id") or "unknown-root"
-        # ── 入口日志：不嵌入 IP 列表（避免前端在逗号处断行），IP 信息已在 act_name 里
-        self.log_info(_("开始判定本组 {n} 台主机（单据 {ticket_id}）").format(n=len(group.units), ticket_id=ticket_id))
+        return group, ticket, root_id, clb_regions
 
-        # ---- 2. 读取上游进程检查节点写入的组级 <ctx> dict ----
-        trans_data = data.get_one_of_inputs("trans_data")
-        # 上游 APPEND 模式产出 trans_data.host_process_check = {ip: <ctx_dict>}
-        # 与 RevokeTransData.host_process_check 静态字段一一对应
+    def _load_ctx_dict(self, trans_data: Any, group: ResourceGroup, node_name: str) -> "Dict[str, Any] | None":
+        """从 trans_data.host_process_check 中读取每台机器的进程扫描 <ctx>。
+
+        :param trans_data: bamboo trans_data
+        :param group: 本组资源组
+        :param node_name: 日志前缀用的节点名
+        :return: ``{ip: ctx_dict}``；校验失败返回 None
+        边界：
+          - trans_data.host_process_check 非 dict -> log error 返回 None
+          - trans_data is None 时视为 {}（下层 F4 判据会收敛为 UNKNOWN）
+        """
         ctx_dict_all: Dict[str, Any] = (
             getattr(trans_data, "host_process_check", None) if trans_data is not None else None
         ) or {}
@@ -196,12 +262,30 @@ class ResourceGroupJudgeService(BaseService):
                     node_name, type(ctx_dict_all).__name__
                 )
             )
-            return False
+            return None
         self.log_info(json.dumps(ctx_dict_all))
-        # 提前把每台机器的 ctx 收集起来，供第 3 步 F4 判据消费
-        ctx_by_ip: Dict[str, Any] = {u.ip: ctx_dict_all.get(u.ip) for u in group.units}
+        return {u.ip: ctx_dict_all.get(u.ip) for u in group.units}
 
-        # ---- 3. 对每台机器串行跑 F1/F2/F3/F4，产出 RevokeVerdict ----
+    def _classify_hosts(
+        self,
+        *,
+        group: ResourceGroup,
+        ticket: Ticket,
+        root_id: str,
+        clb_regions: List[str],
+        ctx_by_ip: Dict[str, Any],
+    ) -> Tuple[RevokeVerdict, ...]:
+        """对组内每台机器串行跑 F1/F2/F3/F4，产出 :class:`RevokeVerdict` 元组。
+
+        :param group: 本组资源组
+        :param ticket: 单据对象（F1 所有权判据需要）
+        :param root_id: pipeline root_id（用于日志）
+        :param clb_regions: F2.b CLB region 列表
+        :param ctx_by_ip: ``{ip: ctx}`` 来自上游进程扫描
+        :return: 单机结论元组，顺序与 group.units 对齐
+        边界：
+          - 单机 F 判据内部异常均在 HostRevokeChecker 中收敛为 UNKNOWN，本方法不处理异常
+        """
         verdicts: List[RevokeVerdict] = []
         for u in group.units:
             checker = HostRevokeChecker(
@@ -218,64 +302,74 @@ class ResourceGroupJudgeService(BaseService):
             f4 = HostRevokeChecker.check_f4_process(ctx_by_ip.get(u.ip), ip=u.ip)
             facts = HostRevokeFacts(f1_ownership=f1, f2_traffic=f2, f3_dbm_residue=f3, f4_process=f4)
             verdict = HostDecisionMatrix.classify(unit=u, facts=facts)
-
-            # ── F2=YES 时从 evidence 中提取 DNS 域名列表，向 DBA 展示具体命中域名（样式 γ）
-            #    取值路径：f2.evidence["dns"]["domain_names"]，与 host_check._sub_check_f2a_dns 产出结构对齐
-            #    只在 f2.state==YES 且域名非空时展开；F2=NO/UNKNOWN 保持原样（避免日志噪音）
-            f2_dns_lines: str = ""
-            if f2.state.value == "yes" and isinstance(f2.evidence, dict):
-                dns_sub: Dict[str, Any] = f2.evidence.get("dns") or {}
-                domain_names: List[str] = list(dns_sub.get("domain_names") or [])
-                if domain_names:
-                    # 逐行展示，与检测项字段对齐的 └─ 层级前缀，保证视觉层次清晰
-                    f2_dns_lines = "\n" + "\n".join("     └─ DNS 域名: {}".format(d) for d in domain_names)
-
-            # ── 单机结论日志：草稿 A 详细版 · 一次 log_info 输出多行，固定格式便于阅读
-            #    每台机器一个完整块：横线分隔 + 主机基本信息 + 检测项 4 项 + 判定结果
-            self.log_info(
-                _(
-                    "\n{sep}\n"
-                    "主机: {ip}\n"
-                    "主机ID: {host_id}\n"
-                    "角色: {role}\n"
-                    "\n"
-                    "【检测项】\n"
-                    "  ① 是否存在非法移动/重新入池  : {f1_zh}\n"
-                    "  ② 是否绑定 DNS 或 CLB 服务   : {f2_zh}{f2_dns_lines}\n"
-                    "  ③ 是否有元数据残留           : {f3_zh}\n"
-                    "  ④ 进程是否存活               : {f4_zh}\n"
-                    "\n"
-                    "【判定结果】\n"
-                    "  {decision_zh}（{decision}）\n"
-                    "  说明: {reason}\n"
-                    "{sep}"
-                ).format(
-                    sep="━" * 60,
-                    ip=u.ip,
-                    host_id=u.bk_host_id,
-                    role=u.role,
-                    f1_zh=f1_zh(f1.state.value),
-                    f2_zh=f2_zh(f2.state.value),
-                    f2_dns_lines=f2_dns_lines,
-                    f3_zh=f3_zh(f3.state.value),
-                    f4_zh=f4_zh(f4.state.value),
-                    decision_zh=host_decision_zh(verdict.decision.value),
-                    decision=verdict.decision.value.upper(),
-                    reason=extract_decision_reason(verdict.reason),
-                )
-            )
+            self._log_host_verdict(unit=u, facts=facts, verdict=verdict)
             verdicts.append(verdict)
+        return tuple(verdicts)
 
-        verdicts_tuple: Tuple[RevokeVerdict, ...] = tuple(verdicts)
+    def _log_host_verdict(self, *, unit: RevokeUnit, facts: HostRevokeFacts, verdict: RevokeVerdict) -> None:
+        """输出单台机器的 \"检测项 + 判定结果\" 多行日志块。
 
-        # ---- 4. 组级 G1 判据 ----
+        :param unit: 单机 RevokeUnit
+        :param facts: F1~F4 判据聚合
+        :param verdict: 单机决策结果
+        """
+        f1, f2, f3, f4 = facts.f1_ownership, facts.f2_traffic, facts.f3_dbm_residue, facts.f4_process
+
+        # ── F2=YES 时从 evidence 中提取 DNS 域名列表（样式 γ），其余状态保持空串避免日志噪音
+        f2_dns_lines: str = ""
+        if f2.state.value == "yes" and isinstance(f2.evidence, dict):
+            dns_sub: Dict[str, Any] = f2.evidence.get("dns") or {}
+            domain_names: List[str] = list(dns_sub.get("domain_names") or [])
+            if domain_names:
+                f2_dns_lines = "\n" + "\n".join("     └─ DNS 域名: {}".format(d) for d in domain_names)
+
+        self.log_info(
+            _(
+                "\n{sep}\n"
+                "主机: {ip}\n"
+                "主机ID: {host_id}\n"
+                "角色: {role}\n"
+                "\n"
+                "【检测项】\n"
+                "  ① 是否存在非法移动/重新入池  : {f1_zh}\n"
+                "  ② 是否绑定 DNS 或 CLB 服务   : {f2_zh}{f2_dns_lines}\n"
+                "  ③ 是否有元数据残留           : {f3_zh}\n"
+                "  ④ 进程是否存活               : {f4_zh}\n"
+                "\n"
+                "【判定结果】\n"
+                "  {decision_zh}（{decision}）\n"
+                "  说明: {reason}\n"
+                "{sep}"
+            ).format(
+                sep="━" * 60,
+                ip=unit.ip,
+                host_id=unit.bk_host_id,
+                role=unit.role,
+                f1_zh=f1_zh(f1.state.value),
+                f2_zh=f2_zh(f2.state.value),
+                f2_dns_lines=f2_dns_lines,
+                f3_zh=f3_zh(f3.state.value),
+                f4_zh=f4_zh(f4.state.value),
+                decision_zh=host_decision_zh(verdict.decision.value),
+                decision=verdict.decision.value.upper(),
+                reason=extract_decision_reason(verdict.reason),
+            )
+        )
+
+    def _classify_group(
+        self, *, group: ResourceGroup, verdicts: Tuple[RevokeVerdict, ...], root_id: str
+    ) -> GroupVerdict:
+        """组级 G1 判据 + 组决策矩阵 + 组日志 + MANUAL warning。
+
+        :param group: 本组资源组
+        :param verdicts: 单机决策元组
+        :param root_id: pipeline root_id（供 ResourceGroupChecker）
+        :return: :class:`GroupVerdict` 组决策结果
+        """
         group_checker = ResourceGroupChecker(root_id=root_id)
-        g1 = group_checker.check_g1_consistency(verdicts_tuple)
+        g1 = group_checker.check_g1_consistency(verdicts)
+        gv: GroupVerdict = GroupDecisionMatrix.classify(group=group, verdicts=verdicts, g1=g1)
 
-        # ---- 5. 组决策 ----
-        gv: GroupVerdict = GroupDecisionMatrix.classify(group=group, verdicts=verdicts_tuple, g1=g1)
-        # ── 组结论日志：多行格式 · 每行一个 IP + 组级检测 G1 + 最终决策
-        #    与单机日志同风格：横线分隔 + 段落 + 【组级检测】/【最终决策】
         ip_lines: str = "\n".join("    - {}".format(u.ip) for u in group.units)
         self.log_info(
             _(
@@ -312,44 +406,101 @@ class ResourceGroupJudgeService(BaseService):
             warning_text = build_group_warning_log(gv)
             self.log_warning(warning_text)
             logger.warning(warning_text)
+        return gv
 
-        # ---- 6. 将 GroupVerdict 写入 trans_data（静态字段：SubProcess 隔离保证组间无冲突）----
-        # 无论本节点最终 return True/False，都先完整写入 trans_data：
-        #   * 写入后下游 cleanup Service 依据 group_verdict_decision 自行分支 no-op，不会误动作
-        #   * 写入后 DBA 重试时，后续排查工具仍可读到本次判定上下文（evidence 完整保留）
+    def _write_trans_data(self, *, data: Any, trans_data: Any, gv: GroupVerdict, node_name: str) -> bool:
+        """将 GroupVerdict 写回 trans_data 的两个静态字段 + data.outputs。
+
+        无论本节点最终 return True / False，都先完整写入 trans_data：
+          - 下游 cleanup Service 依据 group_verdict_decision 自行分支 no-op，不会误动作
+          - DBA 重试时后续排查工具仍可读到本次判定上下文（evidence 完整保留）
+
+        :param data: bamboo 节点数据对象
+        :param trans_data: 当前节点 trans_data
+        :param gv: 组决策结果
+        :param node_name: 日志前缀用的节点名
+        :return: True 写入成功；False 写入异常（理论不可达）
+        """
         try:
             gv_dict: Dict[str, Any] = _group_verdict_to_dict(gv)
             if trans_data is not None:
                 setattr(trans_data, "group_verdict", gv_dict)
                 setattr(trans_data, "group_verdict_decision", gv.decision.value)
             data.outputs["trans_data"] = trans_data
+            return True
         except Exception as err:
             self.log_error(_("[{}] 写入 trans_data 失败: {}").format(node_name, err))
             return False
 
-        # ---- 7. 方案 A：组决策=GROUP_MANUAL 时节点失败，让 DBA 在 pipeline UI 看到红点并人工确认 ----
-        # 设计意图：
-        #   * GROUP_MANUAL 的语义本就是"不能自动判断该否清理"，需 DBA 介入
-        #   * bamboo 尚未接入独立的 Pause 人工确认节点，目前用 return False 代替：
-        #       - DBA 在 pipeline UI 看到判定节点 FAILED，点开可读到完整的单机日志块 + 组级结论
-        #       - DBA 确认后可选：处置完外部问题后"重试" / 直接"跳过"本节点
-        #   * 该失败不影响已写入的 trans_data（步骤 6 已提前落盘）
-        if gv.decision == GroupDecision.GROUP_MANUAL:
-            self.log_error(
-                _(
-                    "\n{sep}\n"
-                    "本组判定结果为【整组挂起（GROUP_MANUAL）】，节点主动失败供人工确认\n"
-                    "  原因：{reason}\n"
-                    "  处置指引：\n"
-                    "    1) 查看上方单机日志块（标题行含主机 IP），确认具体异常机器\n"
-                    "    2) 外部频道处理异常（如手动摘除 DNS / 确认机器归属 / 手动清理残留进程）\n"
-                    "    3) 处理完后在 pipeline 上点击【重试】本节点；若确认无需回收可直接点击【跳过】\n"
-                    "{sep}"
-                ).format(sep="━" * 60, reason=extract_decision_reason(gv.reason))
-            )
-            return False
+    def _pre_declare_flow_summary(self, *, data: Any, gv: GroupVerdict, group: ResourceGroup) -> None:
+        """GROUP_RECYCLE 判决下预申报 FlowSummary（F3=YES 子集）。
 
-        return True
+        设计意图：
+          - 把 \"决策产出 + 决策副产物（FlowSummary 落地）\" 收敛在同一节点，避免散落到段 3；
+          - 筛选 F3=YES 的机器（存在 DBM 元数据残留 → 必然需要被段 3 清元数据）作为 FlowSummary hosts；
+            语义为 \"决策派发\" 而非 \"清理完成\"。
+          - 失败策略：insert_data 异常仅记 ERROR + logger.exception，不改判、不 return False；
+            判决本身已成功产出，摘要表追加失败走人工兜底。
+
+        :param data: bamboo 节点数据对象（用于取 global_data.job_root_id）
+        :param gv: 组决策结果（必须是 GROUP_RECYCLE）
+        :param group: 本组资源组（用于日志 group_id）
+        """
+        summary_hosts: List[Dict[str, Any]] = []
+        for v in gv.verdicts:
+            # verdict 内部仍是 dataclass（本节点内未序列化），直接访问字段
+            if v.facts.f3_dbm_residue.state.value == "yes":
+                summary_hosts.append(
+                    {
+                        "ip": v.unit.ip,
+                        "bk_host_id": v.unit.bk_host_id,
+                        "bk_cloud_id": v.unit.bk_cloud_id,
+                    }
+                )
+        if not summary_hosts:
+            return
+
+        global_data: Dict[str, Any] = data.get_one_of_inputs("global_data") or {}
+        # root_id 优先取 global_data["job_root_id"]（与旧惯例对齐），缺失回退 self.root_id
+        root_id_for_summary: str = global_data.get("job_root_id") or self.root_id
+        try:
+            FlowOutputHandler(RecycleOutputContext.ToResourceSerializer).insert_data(
+                root_id_for_summary, summary_hosts
+            )
+            self.log_info(
+                _("[FlowSummary] 预申报本组待退回机器 {n} 台 · group_id={gid}").format(n=len(summary_hosts), gid=group.group_id)
+            )
+        except Exception as err:
+            # insert_data 失败不阻塞主流程：判决已成功产出，仅摘要表追加失败
+            self.log_error(
+                _("[FlowSummary] 追加失败：{err} · group_id={gid} · 需人工确认摘要表").format(err=err, gid=group.group_id)
+            )
+            logger.exception(err)
+
+    def _emit_manual_failure_log(self, gv: GroupVerdict) -> None:
+        """GROUP_MANUAL 判决下输出失败引导日志（配合 _execute return False）。
+
+        设计意图：
+          - GROUP_MANUAL 的语义本就是 \"不能自动判断该否清理\"，需 DBA 介入
+          - bamboo 尚未接入独立的 Pause 人工确认节点，目前用 return False 代替：
+              * DBA 在 pipeline UI 看到判定节点 FAILED，点开可读到完整的单机日志块 + 组级结论
+              * DBA 确认后可选：处置完外部问题后 \"重试\" / 直接 \"跳过\" 本节点
+          - 该失败不影响已写入的 trans_data（_write_trans_data 已提前落盘）
+
+        :param gv: 组决策结果（必须是 GROUP_MANUAL）
+        """
+        self.log_error(
+            _(
+                "\n{sep}\n"
+                "本组判定结果为【整组挂起（GROUP_MANUAL）】，节点主动失败供人工确认\n"
+                "  原因：{reason}\n"
+                "  处置指引：\n"
+                "    1) 查看上方单机日志块（标题行含主机 IP），确认具体异常机器\n"
+                "    2) 外部频道处理异常（如手动摘除 DNS / 确认机器归属 / 手动清理残留进程）\n"
+                "    3) 处理完后在 pipeline 上点击【重试】本节点；若确认无需回收可直接点击【跳过】\n"
+                "{sep}"
+            ).format(sep="━" * 60, reason=extract_decision_reason(gv.reason))
+        )
 
     def log_warning(self, msg: str) -> None:
         """项目 BaseService 未提供 WARNING 级 log 助手，这里补一个基于 logger 的兜底。

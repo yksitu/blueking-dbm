@@ -16,13 +16,14 @@ specific language governing permissions and limitations under the License.
       * GROUP_RECYCLE 结论：
         - 按 evidence.f3_dbm_residue.tuples 清 StorageInstanceTuple
         - 按 evidence.f3_dbm_residue.machine/storages/proxies 清 Machine 元数据
-        - 把 F4=YES 的机器 IP 写入 ``trans_data.pending_clear_ips``
-        - 本组已清理机器通过 :class:`FlowOutputHandler(RecycleOutputContext.ToResourceSerializer)`
-          追加到 FlowSummary（跨 SubProcess 天然共享；后续接手方从 FlowSummary 读取）
-      * 任一清理步失败 -> 组决策改判 GROUP_MANUAL，本组机器不进 FlowSummary
+      * 任一清理步失败 -> **节点挂起（return False）**，由 DBA 在 bamboo 页面介入排查并原地重试；
+        不做软降级 / 不改判决策，保证清理失败能作为红色告警被及时暴露
+      * 本节点不再向 ``trans_data`` 写入任何字段、不再调用 FlowSummary 写入（见 requirements §1/§2）：
+        - ``pending_clear_ips`` 已废弃；段 4 自主基于 ``group_verdict`` 筛选 F4=yes 的 IP
+        - FlowSummary 写入已前移至段 2 Judge：决策产出瞬间同步追加（语义=决策派发，而非清理完成）
   - :class:`ResourceGroupMachineClearService` · 机器脚本下发（继承自 ClearMachineScriptService）
-      * 从 ``trans_data.pending_clear_ips`` 读 exec_ips
-      * exec_ips 为空 -> 直接 return True 跳过
+      * 直接读 ``trans_data.group_verdict`` + ``group_verdict_decision``，自主筛选 F4=yes 的 IP
+      * 筛选结果为空（含非 RECYCLE / verdicts 空 / 全部 F4=no） -> 直接 return True 跳过
       * 非空 -> 回填 kwargs["exec_ips"] 后走父类 BkJobService 的 Job 下发 + 轮询逻辑
 
 设计要点：
@@ -45,11 +46,9 @@ from pipeline.component_framework.component import Component
 
 from backend.db_meta.models import StorageInstanceTuple
 from backend.flow.consts import DBA_ROOT_USER
-from backend.flow.engine.bamboo.scene.common.machine_os_init import RecycleOutputContext
 from backend.flow.engine.revoke.log_utils import group_decision_zh
 from backend.flow.plugins.components.collections.common.base_service import BaseService
 from backend.flow.plugins.components.collections.common.exec_clear_machine import ClearMachineScriptService
-from backend.flow.utils.base.flow_output import FlowOutputHandler
 
 logger = logging.getLogger("flow")
 
@@ -71,21 +70,16 @@ class ResourceGroupCleanupService(BaseService):
       - ``group_verdict``            asdict 序列化的 :class:`GroupVerdict` dict
       - ``group_verdict_decision``   :class:`GroupDecision` 的 .value 字符串
 
-    trans_data 输出（供段 4 :class:`ResourceGroupMachineClearService` 消费）：
-      - ``pending_clear_ips``   List[Dict{ip, bk_cloud_id}]，本组待清理机器
-      - **外部落地**：本组已清理机器通过
-        :class:`FlowOutputHandler(RecycleOutputContext.ToResourceSerializer)` 追加到
-        FlowSummary 表（``@transaction.atomic + select_for_update``，跨组并发安全，
-        天然累加）；不再走 ``trans_data.recycle_hosts``（SubProcess 隔离无法汇聚）。
-        后续接手方从 FlowSummary 读取本次流程的"退回资源池"摘要。
+    trans_data 输出：
+      - **本节点不再向 trans_data 写入任何字段**（``pending_clear_ips`` 已废弃；
+        段 4 自主基于 ``group_verdict`` 筛选 F4=yes 的 IP 作为 exec_ips）
+      - **本节点不再调用 FlowSummary 写入**（已迁移至段 2 Judge：决策产出瞬间同步追加）
 
     边界：
       - kwargs 关键字段缺失 -> log error 返回 False
-      - group_verdict 缺失 / 非 GROUP_RECYCLE -> no-op 返回 True
-      - 任一清理步失败 -> 记 ERROR 日志、组决策改判 GROUP_MANUAL、清空 pending_clear_ips、
-        本组机器不进 FlowSummary；返回 True（保证不阻塞其他组）
-      - FlowOutputHandler.insert_data 失败 -> 记 ERROR 日志但不改判、不阻塞：
-        机器清理已完成，只是摘要表追加失败，人工兜底
+      - group_verdict 缺失 / 非 GROUP_RECYCLE / verdicts 为空 -> 仅日志输出，直接 return True
+      - 任一清理步失败 -> 记 ERROR 日志、**返回 False 让节点挂起**；
+        由 DBA 在 bamboo 页面排查并原地重试本节点（不做软降级 / 不改判决策）
     """
 
     def _execute(self, data, parent_data) -> bool:
@@ -93,7 +87,7 @@ class ResourceGroupCleanupService(BaseService):
 
         :param data: bamboo 节点数据对象
         :param parent_data: bamboo 父节点数据对象（不使用）
-        :return: True（Service 内异常收敛为组决策改判，不让节点整体失败）
+        :return: True 清理完成 / no-op；False 清理过程异常，节点挂起等待 DBA 介入
         """
         kwargs: Dict[str, Any] = data.get_one_of_inputs("kwargs") or {}
         node_name: str = kwargs.get("node_name") or self.__class__.__name__
@@ -114,9 +108,6 @@ class ResourceGroupCleanupService(BaseService):
 
         if not isinstance(gv_dict, dict) or not gv_dict:
             self.log_error(_("[{}] trans_data.group_verdict 缺失或非 dict，跳过清理").format(node_name))
-            # 写空的 pending_clear_ips，避免下游取到默认零值时的语义不清
-            if trans_data is not None:
-                setattr(trans_data, "pending_clear_ips", [])
             return True
 
         if decision != _GROUP_RECYCLE_VALUE:
@@ -127,52 +118,26 @@ class ResourceGroupCleanupService(BaseService):
                     ips=ips_display,
                 )
             )
-            if trans_data is not None:
-                setattr(trans_data, "pending_clear_ips", [])
             return True
 
         # ---- 2. GROUP_RECYCLE：解析 verdicts 收集清理动作输入 ----
         verdicts: List[Dict[str, Any]] = gv_dict.get("verdicts") or []
         if not verdicts:
             self.log_error(_("[{}] group_verdict.verdicts 为空，跳过清理").format(node_name))
-            if trans_data is not None:
-                setattr(trans_data, "pending_clear_ips", [])
             return True
 
         self.log_info(
             _("开始清理本组 · 单机数={n} 集群数={c} · IP: {ips}").format(n=len(verdicts), c=len(cluster_domains), ips=ips_display)
         )
 
-        cleaned_hosts: List[Dict[str, Any]] = []
-        pending_clear_ips: List[Dict[str, Any]] = []
+        # ---- 3. 逐台执行元数据清理（职责纯粹化：本节点不再做任何 trans_data 写入 / FlowSummary 落地） ----
+        cleaned_ips: List[str] = []
         try:
             for v in verdicts:
                 self._cleanup_one_host(v, node_name=node_name)
-                unit_dict = v.get("unit") or {}
-                ip_val = unit_dict.get("ip")
-                bk_host_id_val = unit_dict.get("bk_host_id")
-                bk_cloud_id_val = unit_dict.get("bk_cloud_id")
-                # 追加到已清理列表；用于外部 FlowOutputHandler 落地
-                # 防御：HostOutputSerializer 的 ip/bk_host_id/bk_cloud_id 为必填字段；任一缺失直接跳过防抛异常
-                if ip_val and bk_host_id_val is not None and bk_cloud_id_val is not None:
-                    cleaned_hosts.append(
-                        {
-                            "ip": ip_val,
-                            "bk_host_id": bk_host_id_val,
-                            "bk_cloud_id": bk_cloud_id_val,
-                        }
-                    )
-                else:
-                    self.log_error(_("[{}] verdict.unit 关键字段缺失，跳过入 FlowSummary；unit={}").format(node_name, unit_dict))
-                # F4=YES 的机器进入待下发清理脚本队列
-                f4_state = ((v.get("facts") or {}).get("f4_process") or {}).get("state")
-                if f4_state == "yes":
-                    pending_clear_ips.append(
-                        {
-                            "ip": unit_dict.get("ip"),
-                            "bk_cloud_id": unit_dict.get("bk_cloud_id"),
-                        }
-                    )
+                ip_val = (v.get("unit") or {}).get("ip")
+                if ip_val:
+                    cleaned_ips.append(ip_val)
 
             # ---- 集群维度元数据清理：不在 revoke_flow 职责范围内 ----
             # revoke_flow 的语义是"退回本单申领的机器"，仅清理 host 相关元数据（Machine / StorageInstanceTuple）。
@@ -180,47 +145,19 @@ class ResourceGroupCleanupService(BaseService):
             # 绝不能在此阶段删除集群维度元数据。若发现孤儿 Cluster 需 DBA 检查后走 destroy_flow 处置。
 
         except Exception as err:
-            self.log_error(
-                _("清理动作失败：{err} · 本组改判为整组挂起（GROUP_MANUAL），机器不进 FlowSummary · IP: {ips}").format(
-                    err=err, ips=ips_display
-                )
-            )
+            # 清理失败属于必须人工关注的严重问题：直接让节点挂起（红色），由 DBA 在 bamboo 页面
+            # 排查原因（元数据状态 / 下游 API / DB 连接等）后原地重试本节点，而非软降级为 MANUAL。
+            # 理由：
+            #   1. 清理过程可能出现"元数据删一半"的中间态，必须阻断下游 Job 下发，防止"元数据乱 + 进程被杀"的脏状态
+            #   2. return False 让 bamboo 节点红色失败，DBA 能第一时间感知，比隐式改判 MANUAL 更强信号
+            #   3. 不写任何 trans_data 字段：节点挂起后下游段 4 不会被执行，无需熔断字段
+            self.log_error(_("清理动作失败：{err} · 节点挂起等待 DBA 介入排查并重试 · IP: {ips}").format(err=err, ips=ips_display))
             logger.exception(err)
-            # 改判组决策（静态字段：SubProcess 隔离保证组间无冲突）
-            if trans_data is not None:
-                setattr(trans_data, "group_verdict_decision", "group_manual")
-                setattr(trans_data, "pending_clear_ips", [])
-            return True
-
-        # ---- 4. 写入 pending_clear_ips，供下一节点消费 ----
-        if trans_data is not None:
-            setattr(trans_data, "pending_clear_ips", pending_clear_ips)
-
-        # ---- 5. 本组可回收机器直接落地到 FlowSummary（跨组累加、跨 SubProcess 天然共享）----
-        # 说明：
-        #   - 不走 trans_data.recycle_hosts：SubProcess 天然隔离，跨组无法汇聚
-        #   - 走 FlowOutputHandler(RecycleOutputContext.ToResourceSerializer).insert_data(...)：
-        #     底层 @transaction.atomic + select_for_update；多组子流程并发追加天然安全；
-        #     无主键 → 走 values.extend，多次调用天然累加
-        #   - root_id 优先从 global_data["job_root_id"] 取（与旧惯例对齐），缺失时回退 self.root_id
-        #   - cleaned_hosts 字段严格对齐 HostOutputSerializer（ip/bk_cloud_id/bk_host_id 必填）
-        #   - TODO(后续): 该 handler 后续会重构，届时替换本段落地实现即可
-        if cleaned_hosts:
-            global_data: Dict[str, Any] = data.get_one_of_inputs("global_data") or {}
-            root_id: str = global_data.get("job_root_id") or self.root_id
-            try:
-                FlowOutputHandler(RecycleOutputContext.ToResourceSerializer).insert_data(root_id, cleaned_hosts)
-            except Exception as err:
-                # insert_data 失败不阻塞主流程：机器已成功清理，只是"退回资源池摘要表"追加失败
-                # 记 ERROR 供人工兜底；组决策不改判
-                self.log_error(
-                    _("追加 ToResourceSerializer 失败：{err}；机器清理已完成，需人工确认摘要表 · IP: {ips}").format(err=err, ips=ips_display)
-                )
-                logger.exception(err)
+            return False
 
         self.log_info(
-            _("清理完成 · 已清理机器数={cleaned} 待下发脚本机器数={pending} · IP: {ips}").format(
-                cleaned=len(cleaned_hosts), pending=len(pending_clear_ips), ips=ips_display
+            _("[清理完成] 已清理机器数={cleaned} · 清理 IP: {cleaned_ips} · IP: {ips}").format(
+                cleaned=len(cleaned_ips), cleaned_ips=",".join(cleaned_ips), ips=ips_display
             )
         )
         return True
@@ -294,46 +231,88 @@ class ResourceGroupMachineClearService(ClearMachineScriptService):
     kwargs 契约：
       - 无必填字段；node_name / root_id / node_id 等由 add_act 自动注入
 
-    trans_data 输入（由段 3 :class:`ResourceGroupCleanupService` 写入）：
-      - ``pending_clear_ips``   List[Dict{ip, bk_cloud_id}]，本组待下发清理脚本的机器
+    trans_data 输入（由段 2 :class:`ResourceGroupJudgeService` 写入）：
+      - ``group_verdict``            asdict 序列化的 :class:`GroupVerdict` dict
+      - ``group_verdict_decision``   :class:`GroupDecision` 的 .value 字符串
 
-    行为：
-      - 从 ``trans_data.pending_clear_ips`` 读机器列表；空 -> 直接 return True 跳过
+    行为（**自主筛选 F4=yes 的 IP**，不再依赖段 3 产出的 ``pending_clear_ips``）：
+      - 非 GROUP_RECYCLE 决策 -> 直接 return True 跳过
+      - verdicts 为空 / 缺失 -> 直接 return True 跳过（log_error 作异常观测点）
+      - 遍历 verdicts 筛选 ``facts.f4_process.state == "yes"`` 的条目组成 ``exec_ips``
+      - 筛选结果为空（全部 F4=no，无进程可清）-> 直接 return True 跳过
       - 非空 -> 回填 kwargs["exec_ips"] + kwargs["account_alias"] 后走父类逻辑
 
     边界：
-      - trans_data.pending_clear_ips 缺失 / 空 -> 视作空列表跳过
+      - trans_data.group_verdict 缺失 / decision 非 GROUP_RECYCLE / verdicts 空 / 筛选结果空
+        -> 均视作 no-op，设置 ``data.outputs.ext_result = True`` 后 return True
       - 父类下发失败 -> 继承父类的 return False 语义
     """
 
     def _execute(self, data, parent_data) -> bool:
-        """从 trans_data 静态字段回填 exec_ips 后走父类逻辑。
+        """从 trans_data.group_verdict 自主筛选 F4=yes 的 IP 作为 exec_ips 后走父类逻辑。
 
         :param data: bamboo 节点数据
         :param parent_data: 父节点数据
-        :return: True 跳过 或 父类 _execute 结果
+        :return: True 跳过（no-op）或 父类 _execute 结果
         """
         kwargs: Dict[str, Any] = data.get_one_of_inputs("kwargs") or {}
         node_name: str = kwargs.get("node_name") or self.__class__.__name__
 
         trans_data = data.get_one_of_inputs("trans_data")
         # 静态字段：SubProcess 隔离保证组间无冲突
-        pending_ips = getattr(trans_data, "pending_clear_ips", None) if trans_data is not None else None
-        if not pending_ips:
-            self.log_info(_("[{}] trans_data.pending_clear_ips 为空，跳过机器脚本清理（no-op）").format(node_name))
+        gv_dict = getattr(trans_data, "group_verdict", None) if trans_data is not None else None
+        decision: str = getattr(trans_data, "group_verdict_decision", "") if trans_data is not None else ""
+
+        # ---- 分支 A：非回收决策（SKIP / KEEP / MANUAL 等） -> no-op ----
+        if decision != _GROUP_RECYCLE_VALUE:
+            self.log_info(
+                _("[{node}] 本组决策={decision}，非回收决策，跳过机器脚本清理（no-op）").format(
+                    node=node_name, decision=decision.upper() if decision else "UNKNOWN"
+                )
+            )
             # 关键契约：父类 BkJobService._schedule 会读 ``data.outputs.ext_result``；
-            # 若不写值则默认 None，父类 L403 ``ext_result["result"]`` 会抛
-            # ``TypeError: 'NoneType' object is not subscriptable``。
-            # 写为 bool 会让父类 ``isinstance(ext_result, bool)`` 分支命中：
-            # 视作同步组件，自动 finish_schedule() 并透传本 return 值，不再轮询 Job 状态。
+            # 若不写值则默认 None，父类 ``ext_result["result"]`` 会抛 TypeError。
+            # 写为 bool 会让父类 ``isinstance(ext_result, bool)`` 分支命中，视作同步组件自动结束调度。
             data.outputs.ext_result = True
             return True
 
-        # 回填 kwargs 字段：exec_ips + account_alias
-        kwargs["exec_ips"] = list(pending_ips)
-        kwargs.setdefault("account_alias", DBA_ROOT_USER)
+        # ---- 分支 B：判决为 RECYCLE 但 verdicts 空 -> 异常观测点，但 no-op 不阻塞 ----
+        verdicts: List[Dict[str, Any]] = (gv_dict or {}).get("verdicts") or [] if isinstance(gv_dict, dict) else []
+        if not verdicts:
+            self.log_error(
+                _("[{node}] group_verdict_decision=GROUP_RECYCLE 但 verdicts 为空，跳过机器脚本清理").format(node=node_name)
+            )
+            data.outputs.ext_result = True
+            return True
 
-        # 走父类下发逻辑
+        # ---- 分支 C：遍历 verdicts 筛选 F4=yes 的 unit，组装 exec_ips ----
+        exec_ips: List[Dict[str, Any]] = []
+        for v in verdicts:
+            f4_state: str = ((v.get("facts") or {}).get("f4_process") or {}).get("state") or ""
+            if f4_state != "yes":
+                continue
+            unit_dict: Dict[str, Any] = v.get("unit") or {}
+            ip_val = unit_dict.get("ip")
+            bk_cloud_id_val = unit_dict.get("bk_cloud_id")
+            if not ip_val or bk_cloud_id_val is None:
+                self.log_error(
+                    _("[{node}] verdict.unit 关键字段缺失，跳过本机 F4 清理；unit={unit}").format(node=node_name, unit=unit_dict)
+                )
+                continue
+            exec_ips.append({"ip": ip_val, "bk_cloud_id": bk_cloud_id_val})
+
+        # ---- 分支 D：筛选结果为空（所有机器 F4=no，无进程可清） -> no-op ----
+        if not exec_ips:
+            self.log_info(_("[{node}] 所有机器 F4=no，无需脚本清理（no-op）").format(node=node_name))
+            data.outputs.ext_result = True
+            return True
+
+        # ---- 分支 E：有需要清进程的机器 -> 回填 kwargs 后走父类下发逻辑 ----
+        kwargs["exec_ips"] = exec_ips
+        kwargs.setdefault("account_alias", DBA_ROOT_USER)
+        self.log_info(
+            _("[{node}] 准备下发机器脚本清理 · 机器数={n} · exec_ips={ips}").format(node=node_name, n=len(exec_ips), ips=exec_ips)
+        )
         return super()._execute(data=data, parent_data=parent_data)
 
 

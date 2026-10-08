@@ -15,8 +15,9 @@ TenDBHA 部署单据主机退回顶层编排 · v2 · F 模型 + 一组资源绑
   - 编排"每 apply_info 一组，组间并行"的合并子流程（单 SubProcess 内 4 段串行）：
       · 段 1: 进程扫描（单 act 多 IP + APPEND）→ trans_data.host_process_check
       · 段 2: 组级判定（F1~F4 + G1/G2 + 决策矩阵）→ trans_data.group_verdict / group_verdict_decision
-      · 段 3: 元数据+DNS 精确清理（非 GROUP_RECYCLE 自动 no-op）→ trans_data.pending_clear_ips
-      · 段 4: 机器脚本清理（空则 no-op）
+         且 GROUP_RECYCLE 判决产出瞬间同步追加 FlowSummary（预申报语义）
+      · 段 3: 元数据精确清理（非 GROUP_RECYCLE 自动 no-op）；不再向 trans_data 写入任何字段
+      · 段 4: 机器脚本清理（自主基于 trans_data.group_verdict 筛选 F4=yes 的 IP；空则 no-op）
 设计要点：
   - **顶层 try/except 兜底**：任何未处理异常 → 记 ERROR 日志 + 空 recycle_hosts 结束，
     避免阻塞 RECYCLE_APPLY_HOST 主单据

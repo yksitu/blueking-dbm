@@ -26,7 +26,7 @@ specific language governing permissions and limitations under the License.
     frozen 会禁止赋值；slots 与 dataclass 组合有兼容性坑，无必要。
 """
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 
 @dataclass
@@ -40,16 +40,22 @@ class RevokeTransData:
         静态字段串联
 
     段间传递契约（同一 SubProcess 内按顺序读写）：
-      - :attr:`host_process_check`    段 1 → 段 2 · 进程扫描结果 ``{ip: <ctx_dict>}``
-        （由 :class:`MySQLHostProcessCheckService` 以 APPEND 模式写入）
-      - :attr:`group_verdict`         段 2 → 段 3 · 组级判定结果 dict
-        （由 :class:`ResourceGroupJudgeService` 写入 :func:`asdict` 序列化后的 GroupVerdict）
-      - :attr:`group_verdict_decision` 段 2 → 段 3 · 组决策字符串
-        （``group_recycle`` / ``group_manual`` 等；供清理 Service 分支判断，
+      - :attr:`host_process_check`     段 1 → 段 2 · 进程扫描结果 ``{ip: <ctx_dict>}``
+        （由 :class:`MySQLHostProcessCheckService` 以 APPEND 模式写入，
+        :class:`ResourceGroupJudgeService` 按 ip 索引消费）
+      - :attr:`group_verdict`          段 2 → 段 3 / 段 4 · 组级判定结果 dict
+        （由 :class:`ResourceGroupJudgeService` 写入 :func:`asdict` 序列化后的
+        GroupVerdict；段 3 据此遍历 F3 evidence 清元数据，段 4 据此遍历
+        F4=yes 筛选 exec_ips）
+      - :attr:`group_verdict_decision` 段 2 → 段 3 / 段 4 · 组决策字符串
+        （``group_recycle`` / ``group_manual`` 等；供下游 Service 分支判断，
         避免嵌套 dict 取值）
-      - :attr:`pending_clear_ips`     段 3 → 段 4 · 本组待下发清理脚本的机器列表
-        （由 :class:`ResourceGroupCleanupService` 写入，
-        :class:`ResourceGroupMachineClearService` 读取）
+
+    契约演进说明（历史字段退场）：
+      - ``pending_clear_ips``（旧：段 3 → 段 4）已废弃；段 4 现基于 :attr:`group_verdict`
+        自主筛选 F4=yes 的 IP，消除"同一语义两个字段"的冗余
+      - FlowSummary 写入职责已从段 3 迁移至段 2 Judge（判决产出瞬间同步落盘），
+        不再是 trans_data 字段，由 :class:`FlowOutputHandler` 跨 SubProcess 共享
 
     线程安全：非线程安全（bamboo 单实例执行）
 
@@ -60,13 +66,16 @@ class RevokeTransData:
 
     #: 段 1 → 段 2 · 进程扫描结果 dict；结构 ``{ip: <ctx_dict>}``；
     #: 由 MySQLHostProcessCheckService（APPEND 模式）写入
+    #: 最小示例： ``{"1.1.1.1": {"process_list": [...], "ports": [...]}, ...}``
     host_process_check: Dict[str, Any] = field(default_factory=dict)
 
-    #: 段 2 → 段 3 · 组级判定结果 dict（asdict(GroupVerdict) + 枚举转 value 后的结构）
+    #: 段 2 → 段 3 / 段 4 · 组级判定结果 dict（asdict(GroupVerdict) + 枚举转 value 后的结构）
+    #: 最小示例： ``{"group": {...}, "decision": "group_recycle",
+    #:            "verdicts": [{"unit": {"ip": ..., "bk_host_id": ..., "bk_cloud_id": ...},
+    #:                          "facts": {"f3_dbm_residue": {"state": "yes", "evidence": {...}},
+    #:                                    "f4_process": {"state": "yes"}}, ...}]}``
     group_verdict: Dict[str, Any] = field(default_factory=dict)
 
-    #: 段 2 → 段 3 · 组决策字符串（GroupDecision.value：group_recycle / group_manual / ...）
+    #: 段 2 → 段 3 / 段 4 · 组决策字符串（GroupDecision.value：group_recycle / group_manual / ...）
+    #: 最小示例： ``"group_recycle"``
     group_verdict_decision: str = ""
-
-    #: 段 3 → 段 4 · 本组待下发机器清理脚本的机器列表；每项 ``{ip, bk_cloud_id}``
-    pending_clear_ips: List[Dict[str, Any]] = field(default_factory=list)
