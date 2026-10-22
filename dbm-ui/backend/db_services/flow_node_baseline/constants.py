@@ -233,12 +233,14 @@ STOCK_DEFAULT_LOOKBACK_DAYS: int = 365
 #: - pause                        : 通用人工暂停节点
 #: - pause_with_ticket_lock_check : 带单据锁校验的人工暂停节点
 #: - sidecar_check_cluster_alarm_for_ai : 单据值守不做处理
+#: - sidecar_check_node_duration_for_ai : 节点耗时值守 sidecar 自身，不参与基线
 #: - mysql_dts_poll_confirm_alive : DTS 确认节点（待办 + 存活轮询，等人确认）
 EXCLUDED_COMPONENT_CODES: frozenset = frozenset(
     {
         "pause",
         "pause_with_ticket_lock_check",
         "sidecar_check_cluster_alarm_for_ai",
+        "sidecar_check_node_duration_for_ai",
         "mysql_dts_poll_confirm_alive",
     }
 )
