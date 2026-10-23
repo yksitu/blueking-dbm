@@ -167,11 +167,12 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
         """以生成器方式产出当前 flow 内所有合法的"运行中节点"。
 
         流程：
-          1. 查 FlowNode: `root_id=ctx.root_id, status=RUNNING, started_at is not null`
-          2. 用 `_FlowTreeParser.extract` 展开 tree 得 `{node_id: (component_code, raw_name)}`
-          3. 对每个节点做四道过滤：node_id 不在解析结果 / component_code 为空 /
+          1. 查 FlowNode: 先对本 root_id 下所有节点做 status 分布统计（排障用，info 日志）
+          2. 再过滤出 `status=RUNNING AND started_at IS NOT NULL`
+          3. 用 `_FlowTreeParser.extract` 展开 tree 得 `{node_id: (component_code, raw_name)}`
+          4. 对每个节点做四道过滤：node_id 不在解析结果 / component_code 为空 /
              component_code 命中 `EXCLUDED_COMPONENT_CODES` 黑名单 / 时钟回拨
-          4. 计算 `elapsed_seconds = ceil((now - started_at).total_seconds())`
+          5. 计算 `elapsed_seconds = ceil((now - started_at).total_seconds())`
 
         :param ctx: `_prepare_context` 产出的上下文
         :yield: `_RunningNode`
@@ -189,6 +190,22 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
             self.log_info(_("[NodeDuration] tree 解析为空，root_id={}".format(root_id)))
             return
 
+        # 排障诊断：先把 root_id 下**所有节点**的 status 分布打印出来，
+        # 便于定位"主流程节点为什么扫不到"——是没 RUNNING？在 SUSPENDED？还是 label_map 对不上？
+        try:
+            from django.db.models import Count
+
+            status_rows = (
+                FlowNode.objects.filter(root_id=root_id)
+                .values("status")
+                .annotate(cnt=Count("node_id"))
+                .order_by("status")
+            )
+            status_dist: Dict[str, int] = {row["status"]: row["cnt"] for row in status_rows}
+            self.log_info(_("[NodeDuration][诊断] root_id={} 当前 FlowNode 状态分布={}".format(root_id, status_dist)))
+        except Exception as err:
+            self.log_warning(_("[NodeDuration][诊断] 统计 FlowNode 状态分布失败 err={}".format(err)))
+
         try:
             qs = FlowNode.objects.filter(
                 root_id=root_id,
@@ -200,18 +217,44 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
             self.log_warning(_("[NodeDuration] 查询 FlowNode 失败 root_id={} err={}".format(root_id, err)))
             return
 
+        self.log_info(
+            _(
+                "[NodeDuration] 本轮扫描到 {} 个 status=RUNNING 的 FlowNode，tree 解析出 {} 个 activity label".format(
+                    len(running_nodes), len(label_map)
+                )
+            )
+        )
+
         for node in running_nodes:
             label = label_map.get(node.node_id)
             if label is None:
-                self.log_info(_("[NodeDuration] node_id={} 不在 tree 解析结果中，跳过".format(node.node_id)))
+                # 典型漏召场景一：FlowNode 表里记录了节点，但 tree 解析不含该 node_id
+                # 原因可能：SubProcess 父节点 / tree 结构里被当作网关跳过 / 动态插入节点
+                self.log_info(
+                    _(
+                        "[NodeDuration][诊断] node_id={} status={} started_at={} 不在 tree label_map 中，跳过".format(
+                            node.node_id, node.status, node.started_at
+                        )
+                    )
+                )
                 continue
             component_code, raw_name = label
             if not component_code:
-                self.log_info(_("[NodeDuration] node_id={} component_code 为空，跳过".format(node.node_id)))
+                self.log_info(
+                    _("[NodeDuration][诊断] node_id={} raw_name={} component_code 为空，跳过".format(node.node_id, raw_name))
+                )
                 continue
             if component_code in EXCLUDED_COMPONENT_CODES:
                 # 黑名单节点（如 pause / 本服务自身 / check_cluster_alarm_for_ai 等）
-                # 与 FlowSampleCollector 对齐：**静默跳过**，不打 info 日志，避免高频节点刷屏
+                # 与 FlowSampleCollector 对齐：命中黑名单静默跳过，避免高频节点刷屏
+                # 排障期间临时打 info，稳定后可改回静默
+                self.log_info(
+                    _(
+                        "[NodeDuration][诊断] node_id={} code={} raw={} 命中黑名单，静默跳过".format(
+                            node.node_id, component_code, raw_name
+                        )
+                    )
+                )
                 continue
 
             delta_seconds: float = (now_time - node.started_at).total_seconds()
@@ -219,13 +262,23 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
                 # 时钟回拨：started_at 在未来，不参与告警判定
                 self.log_info(
                     _(
-                        "[NodeDuration] node_id={} 时钟回拨（started_at={} now={}），跳过".format(
+                        "[NodeDuration][诊断] node_id={} 时钟回拨（started_at={} now={}），跳过".format(
                             node.node_id, node.started_at, now_time
                         )
                     )
                 )
                 continue
             elapsed_seconds: int = int(math.ceil(delta_seconds))
+
+            # 候选节点明细：每个通过全部过滤的 running node 都在此落日志，
+            # 便于确认"哪些真正进入了后续基线查询"
+            self.log_info(
+                _(
+                    "[NodeDuration][候选] node_id={} code={} raw={} elapsed={}s".format(
+                        node.node_id, component_code, raw_name, elapsed_seconds
+                    )
+                )
+            )
 
             yield _RunningNode(
                 node=node,
