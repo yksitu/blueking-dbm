@@ -609,11 +609,12 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
         :return: 恒 True（保证不污染主 flow 节点状态）
         边界：全程异常内吞 + 日志；单节点失败不中断整轮
         """
+        self.log_info("=================================")
         ctx: Optional[Dict] = self._prepare_context(data)
         if ctx is None:
             return True
         running_nodes = self._iter_running_nodes(ctx)
-
+        self.log_info(running_nodes)
         if not running_nodes:
             self.log_info(_("[NodeDuration] 没有运行中的节点，本轮跳过"))
 
