@@ -200,10 +200,6 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
             self.log_warning(_("[NodeDuration] 查询 FlowNode 失败 root_id={} err={}".format(root_id, err)))
             return
 
-        self.log_info(
-            _("[NodeDuration] 本轮扫描到 {} 个运行中节点，tree 解析出 {} 个 activity label".format(len(running_nodes), len(label_map)))
-        )
-
         for node in running_nodes:
             label = label_map.get(node.node_id)
             if label is None:
