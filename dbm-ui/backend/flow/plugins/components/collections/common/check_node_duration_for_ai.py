@@ -424,6 +424,29 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
                 )
             )
             return None
+
+        # 命中：打印基线详情，便于人工核对"查到的基线是否对得上节点语义"
+        self.log_info(
+            _(
+                "[NodeDuration][命中] 基线查询成功 "
+                "tt={} biz={} code={} name={} | "
+                "p95={}s p99={}s mean={}s stddev={}s | "
+                "sample_count={} is_reliable={} distribution={} baseline_version=v{}".format(
+                    ticket_type,
+                    bk_biz_id,
+                    component_code,
+                    normalized_name,
+                    row.p95_seconds,
+                    row.p99_seconds,
+                    round(row.mean_seconds or 0, 2),
+                    round(row.stddev_seconds or 0, 2),
+                    int(row.sample_count or 0),
+                    row.is_reliable,
+                    row.distribution_type or "",
+                    int(row.baseline_version or 1),
+                )
+            )
+        )
         return row
 
     @staticmethod
