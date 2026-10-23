@@ -449,8 +449,7 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
         )
         return row
 
-    @staticmethod
-    def _classify_breach(elapsed: int, baseline: FlowNodeDurationBaseline) -> BreachLevel:
+    def _classify_breach(self, elapsed: int, baseline: FlowNodeDurationBaseline) -> BreachLevel:
         """按阈值严格分类超线等级。
 
         规则：
@@ -463,9 +462,16 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
         :return: `BreachLevel`
         """
         if elapsed > (baseline.p99_seconds or 0):
+            self.log_warning(
+                "[NodeDuration][超线] elapsed={} baseline.p99_seconds={}".format(elapsed, baseline.p99_seconds)
+            )
             return BreachLevel.P99
         if elapsed > (baseline.p95_seconds or 0):
+            self.log_warning(
+                _("[NodeDuration][超线] elapsed={} baseline.p95_seconds={}".format(elapsed, baseline.p95_seconds))
+            )
             return BreachLevel.P95
+        self.log_info(_("[NodeDuration][正常]耗时分析正常"))
         return BreachLevel.NONE
 
     # =========================================================================
