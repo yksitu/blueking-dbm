@@ -217,14 +217,6 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
             self.log_warning(_("[NodeDuration] 查询 FlowNode 失败 root_id={} err={}".format(root_id, err)))
             return
 
-        self.log_info(
-            _(
-                "[NodeDuration] 本轮扫描到 {} 个 status=RUNNING 的 FlowNode，tree 解析出 {} 个 activity label".format(
-                    len(running_nodes), len(label_map)
-                )
-            )
-        )
-
         for node in running_nodes:
             label = label_map.get(node.node_id)
             if label is None:
@@ -247,14 +239,6 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
             if component_code in EXCLUDED_COMPONENT_CODES:
                 # 黑名单节点（如 pause / 本服务自身 / check_cluster_alarm_for_ai 等）
                 # 与 FlowSampleCollector 对齐：命中黑名单静默跳过，避免高频节点刷屏
-                # 排障期间临时打 info，稳定后可改回静默
-                self.log_info(
-                    _(
-                        "[NodeDuration][诊断] node_id={} code={} raw={} 命中黑名单，静默跳过".format(
-                            node.node_id, component_code, raw_name
-                        )
-                    )
-                )
                 continue
 
             delta_seconds: float = (now_time - node.started_at).total_seconds()
@@ -428,22 +412,17 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
         # 命中：打印基线详情，便于人工核对"查到的基线是否对得上节点语义"
         self.log_info(
             _(
-                "[NodeDuration][命中] 基线查询成功 "
-                "tt={} biz={} code={} name={} | "
-                "p95={}s p99={}s mean={}s stddev={}s | "
-                "sample_count={} is_reliable={} distribution={} baseline_version=v{}".format(
+                "[NodeDuration][命中] 基线查询成功 \n"
+                "tt={} \n biz={} \n code={} \n name={} \n "
+                "p95={}s \n p99={}s \n  "
+                "sample_count={} ".format(
                     ticket_type,
                     bk_biz_id,
                     component_code,
                     normalized_name,
                     row.p95_seconds,
                     row.p99_seconds,
-                    round(row.mean_seconds or 0, 2),
-                    round(row.stddev_seconds or 0, 2),
                     int(row.sample_count or 0),
-                    row.is_reliable,
-                    row.distribution_type or "",
-                    int(row.baseline_version or 1),
                 )
             )
         )
