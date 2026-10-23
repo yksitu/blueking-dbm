@@ -44,6 +44,7 @@ from pipeline.core.flow import StaticIntervalGenerator
 
 from backend.core import notify
 from backend.db_report.models import FlowNodeDurationBaseline, FlowNodeNameAlias
+from backend.db_services.flow_node_baseline.constants import EXCLUDED_COMPONENT_CODES
 from backend.db_services.flow_node_baseline.name_cleaner import NameCleaner
 from backend.db_services.flow_node_baseline.sample_collector import _FlowTreeParser
 from backend.flow.consts import StateType
@@ -168,7 +169,8 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
         流程：
           1. 查 FlowNode: `root_id=ctx.root_id, status=RUNNING, started_at is not null`
           2. 用 `_FlowTreeParser.extract` 展开 tree 得 `{node_id: (component_code, raw_name)}`
-          3. 对每个节点做三道过滤：node_id 不在解析结果 / component_code 为空 / 时钟回拨
+          3. 对每个节点做四道过滤：node_id 不在解析结果 / component_code 为空 /
+             component_code 命中 `EXCLUDED_COMPONENT_CODES` 黑名单 / 时钟回拨
           4. 计算 `elapsed_seconds = ceil((now - started_at).total_seconds())`
 
         :param ctx: `_prepare_context` 产出的上下文
@@ -210,6 +212,10 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
             component_code, raw_name = label
             if not component_code:
                 self.log_info(_("[NodeDuration] node_id={} component_code 为空，跳过".format(node.node_id)))
+                continue
+            if component_code in EXCLUDED_COMPONENT_CODES:
+                # 黑名单节点（如 pause / 本服务自身 / check_cluster_alarm_for_ai 等）
+                # 与 FlowSampleCollector 对齐：**静默跳过**，不打 info 日志，避免高频节点刷屏
                 continue
 
             delta_seconds: float = (now_time - node.started_at).total_seconds()
@@ -613,13 +619,9 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
         ctx: Optional[Dict] = self._prepare_context(data)
         if ctx is None:
             return True
-        running_nodes = self._iter_running_nodes(ctx)
-        self.log_info(running_nodes)
-        if not running_nodes:
-            self.log_info(_("[NodeDuration] 没有运行中的节点，本轮跳过"))
 
         processed: int = 0
-        for rn in running_nodes:
+        for rn in self._iter_running_nodes(ctx):
             try:
                 # 归一化（只读查 alias，不落库、不调 LLM）
                 normalized_name: Optional[str] = self._lookup_alias_readonly(
