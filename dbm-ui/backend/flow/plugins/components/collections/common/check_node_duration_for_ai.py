@@ -174,8 +174,8 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
         :param ctx: `_prepare_context` 产出的上下文
         :yield: `_RunningNode`
         边界：
-          - tree 解析为空 → 直接返回（打 debug 日志）
-          - 单节点 label 缺失 / started_at 未来 → 跳过并打 debug 日志
+          - tree 解析为空 → 直接返回（打 info 日志）
+          - 单节点 label 缺失 / started_at 未来 → 跳过并打 info 日志
           - FlowNode 查询异常 → 打 warning 日志、本轮产出空流
         """
         root_id: str = ctx["root_id"]
@@ -184,7 +184,7 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
 
         label_map: Dict[str, Tuple[str, str]] = _FlowTreeParser.extract(flow_tree.tree)
         if not label_map:
-            logger.debug("[NodeDuration] tree 解析为空，root_id=%s", root_id)
+            self.log_info(_("[NodeDuration] tree 解析为空，root_id={}".format(root_id)))
             return
 
         try:
@@ -195,27 +195,32 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
             ).only("node_id", "started_at", "version_id", "status")
             running_nodes = list(qs)
         except Exception as err:
-            logger.warning("[NodeDuration] 查询 FlowNode 失败 root_id=%s err=%s", root_id, err)
+            self.log_warning(_("[NodeDuration] 查询 FlowNode 失败 root_id={} err={}".format(root_id, err)))
             return
+
+        self.log_info(
+            _("[NodeDuration] 本轮扫描到 {} 个运行中节点，tree 解析出 {} 个 activity label".format(len(running_nodes), len(label_map)))
+        )
 
         for node in running_nodes:
             label = label_map.get(node.node_id)
             if label is None:
-                logger.debug("[NodeDuration] node_id=%s 不在 tree 解析结果中，跳过", node.node_id)
+                self.log_info(_("[NodeDuration] node_id={} 不在 tree 解析结果中，跳过".format(node.node_id)))
                 continue
             component_code, raw_name = label
             if not component_code:
-                logger.debug("[NodeDuration] node_id=%s component_code 为空，跳过", node.node_id)
+                self.log_info(_("[NodeDuration] node_id={} component_code 为空，跳过".format(node.node_id)))
                 continue
 
             delta_seconds: float = (now_time - node.started_at).total_seconds()
             if delta_seconds < 0:
                 # 时钟回拨：started_at 在未来，不参与告警判定
-                logger.debug(
-                    "[NodeDuration] node_id=%s 时钟回拨（started_at=%s now=%s），跳过",
-                    node.node_id,
-                    node.started_at,
-                    now_time,
+                self.log_info(
+                    _(
+                        "[NodeDuration] node_id={} 时钟回拨（started_at={} now={}），跳过".format(
+                            node.node_id, node.started_at, now_time
+                        )
+                    )
                 )
                 continue
             elapsed_seconds: int = int(math.ceil(delta_seconds))
@@ -258,12 +263,12 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
         try:
             cleaned_name: str = self._cleaner.clean(raw_name)
         except Exception as err:
-            logger.warning(
-                "[NodeDuration] NameCleaner 异常 tt=%s code=%s raw=%s err=%s",
-                ticket_type,
-                component_code,
-                raw_name,
-                err,
+            self.log_warning(
+                _(
+                    "[NodeDuration] NameCleaner 异常 tt={} code={} raw={} err={}".format(
+                        ticket_type, component_code, raw_name, err
+                    )
+                )
             )
             return None
         if not cleaned_name:
@@ -285,12 +290,12 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
                 .first()
             )
         except Exception as err:
-            logger.warning(
-                "[NodeDuration] 查 FlowNodeNameAlias 失败 tt=%s code=%s cleaned=%s err=%s",
-                ticket_type,
-                component_code,
-                cleaned_name,
-                err,
+            self.log_warning(
+                _(
+                    "[NodeDuration] 查 FlowNodeNameAlias 失败 tt={} code={} cleaned={} err={}".format(
+                        ticket_type, component_code, cleaned_name, err
+                    )
+                )
             )
             return None
 
@@ -339,27 +344,29 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
                 .first()
             )
         except Exception as err:
-            logger.warning(
-                "[NodeDuration] 查询基线失败 tt=%s biz=%s code=%s name=%s err=%s",
-                ticket_type,
-                bk_biz_id,
-                component_code,
-                normalized_name,
-                err,
+            self.log_warning(
+                _(
+                    "[NodeDuration] 查询基线失败 tt={} biz={} code={} name={} err={}".format(
+                        ticket_type, bk_biz_id, component_code, normalized_name, err
+                    )
+                )
             )
             return None
 
         if row is None:
             return None
         if (row.p95_seconds or 0) <= 0 or (row.p99_seconds or 0) <= 0:
-            logger.info(
-                "[NodeDuration] 基线阈值无效 tt=%s biz=%s code=%s name=%s p95=%s p99=%s",
-                ticket_type,
-                bk_biz_id,
-                component_code,
-                normalized_name,
-                row.p95_seconds,
-                row.p99_seconds,
+            self.log_info(
+                _(
+                    "[NodeDuration] 基线阈值无效 tt={} biz={} code={} name={} p95={} p99={}".format(
+                        ticket_type,
+                        bk_biz_id,
+                        component_code,
+                        normalized_name,
+                        row.p95_seconds,
+                        row.p99_seconds,
+                    )
+                )
             )
             return None
         return row
@@ -466,32 +473,29 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
                 },
             )
         except Exception as err:
-            logger.warning("[NodeDuration] P95 get_or_create 失败 node_id=%s err=%s", rn.node.node_id, err)
+            self.log_warning(_("[NodeDuration] P95 get_or_create 失败 node_id={} err={}".format(rn.node.node_id, err)))
             return
 
         if report.p95_notified:
-            self.log_info(_("[NodeDuration] P95 已发过，跳过 node_id={}").format(rn.node.node_id))
+            self.log_info(_("[NodeDuration] P95 已发过，跳过 node_id={}".format(rn.node.node_id)))
             return
 
         content: str = self._build_message(
             level=BreachLevel.P95,
             ctx=ctx,
-            node=rn.node,
             elapsed_seconds=rn.elapsed_seconds,
             baseline=baseline,
             raw_name=rn.raw_name,
-            normalized_name=normalized_name,
-            component_code=rn.component_code,
         )
 
         try:
             self.log_info(
-                _("[NodeDuration] 推送 P95 提醒 node_id={} elapsed={}s").format(rn.node.node_id, rn.elapsed_seconds)
+                _("[NodeDuration] 推送 P95 提醒 node_id={} elapsed={}s".format(rn.node.node_id, rn.elapsed_seconds))
             )
             notify.send_msg_for_ai_task_guardian(ticket_id=ctx["ticket_id"], ai_result=content)
         except Exception as err:
             # 推送失败不更新 p95_notified，下一轮重试
-            self.log_error(_("[NodeDuration] P95 推送失败 node_id={} err={}").format(rn.node.node_id, err))
+            self.log_error(_("[NodeDuration] P95 推送失败 node_id={} err={}".format(rn.node.node_id, err)))
             return
 
         try:
@@ -503,7 +507,7 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
                 report.normalized_name = normalized_name
             report.save(update_fields=["p95_notified", "component_code", "normalized_name"])
         except Exception as err:
-            logger.warning("[NodeDuration] P95 更新标志失败 node_id=%s err=%s", rn.node.node_id, err)
+            self.log_warning(_("[NodeDuration] P95 更新标志失败 node_id={} err={}".format(rn.node.node_id, err)))
 
     def _handle_p99(
         self,
@@ -534,7 +538,7 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
                 },
             )
         except Exception as err:
-            logger.warning("[NodeDuration] P99 get_or_create 失败 node_id=%s err=%s", rn.node.node_id, err)
+            self.log_warning(_("[NodeDuration] P99 get_or_create 失败 node_id={} err={}".format(rn.node.node_id, err)))
             return
 
         # 若 kwargs 开关变化，刷到最新；避免老记录卡在旧状态
@@ -543,16 +547,20 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
             try:
                 report.save(update_fields=["enable_converge"])
             except Exception as err:
-                logger.warning("[NodeDuration] P99 更新 enable_converge 失败 node_id=%s err=%s", rn.node.node_id, err)
+                self.log_warning(
+                    _("[NodeDuration] P99 更新 enable_converge 失败 node_id={} err={}".format(rn.node.node_id, err))
+                )
 
         try:
             should_send, reason = report.should_send(current_risk_level="high", is_same_risk=None)
         except Exception as err:
-            logger.warning("[NodeDuration] P99 should_send 异常，降级为允许推送 node_id=%s err=%s", rn.node.node_id, err)
+            self.log_warning(
+                _("[NodeDuration] P99 should_send 异常，降级为允许推送 node_id={} err={}".format(rn.node.node_id, err))
+            )
             should_send, reason = True, _("should_send 异常降级")
 
         self.log_info(
-            _("[NodeDuration] P99 收敛判定 node_id={} 允许推送={} 原因={}").format(rn.node.node_id, should_send, reason)
+            _("[NodeDuration] P99 收敛判定 node_id={} 允许推送={} 原因={}".format(rn.node.node_id, should_send, reason))
         )
         if not should_send:
             return
@@ -560,21 +568,18 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
         content: str = self._build_message(
             level=BreachLevel.P99,
             ctx=ctx,
-            node=rn.node,
             elapsed_seconds=rn.elapsed_seconds,
             baseline=baseline,
             raw_name=rn.raw_name,
-            normalized_name=normalized_name,
-            component_code=rn.component_code,
         )
 
         try:
             self.log_info(
-                _("[NodeDuration] 推送 P99 提醒 node_id={} elapsed={}s").format(rn.node.node_id, rn.elapsed_seconds)
+                _("[NodeDuration] 推送 P99 提醒 node_id={} elapsed={}s".format(rn.node.node_id, rn.elapsed_seconds))
             )
             notify.send_msg_for_ai_task_guardian(ticket_id=ctx["ticket_id"], ai_result=content)
         except Exception as err:
-            self.log_error(_("[NodeDuration] P99 推送失败 node_id={} err={}").format(rn.node.node_id, err))
+            self.log_error(_("[NodeDuration] P99 推送失败 node_id={} err={}".format(rn.node.node_id, err)))
             return
 
         try:
@@ -590,7 +595,7 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
             if dirty:
                 report.save(update_fields=dirty)
         except Exception as err:
-            logger.warning("[NodeDuration] P99 record_send 失败 node_id=%s err=%s", rn.node.node_id, err)
+            self.log_warning(_("[NodeDuration] P99 record_send 失败 node_id={} err={}".format(rn.node.node_id, err)))
 
     # =========================================================================
     # 阶段 6：主入口
@@ -607,9 +612,13 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
         ctx: Optional[Dict] = self._prepare_context(data)
         if ctx is None:
             return True
+        running_nodes = self._iter_running_nodes(ctx)
+
+        if not running_nodes:
+            self.log_info(_("[NodeDuration] 没有运行中的节点，本轮跳过"))
 
         processed: int = 0
-        for rn in self._iter_running_nodes(ctx):
+        for rn in running_nodes:
             try:
                 # 归一化（只读查 alias，不落库、不调 LLM）
                 normalized_name: Optional[str] = self._lookup_alias_readonly(
@@ -621,12 +630,13 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
                     # 未命中 alias 表：可能是全新变体（基线也无从比对），
                     # 也可能是"已有同桶但本 cleaned_name 本次首见"（存在召回缺口，
                     # 需后续基于日志数据观测再决定是否引入兜底策略）
-                    logger.info(
-                        "[NodeDuration] alias 未命中，证明这个节点之前没有统计耗时情况 " "tt=%s code=%s raw=%s node_id=%s；本轮跳过",
-                        ctx["ticket_type"],
-                        rn.component_code,
-                        rn.raw_name,
-                        rn.node.node_id,
+                    self.log_info(
+                        _(
+                            "[NodeDuration] alias 未命中，证明这个节点之前没有统计耗时情况 "
+                            "tt={} code={} raw={} node_id={}；本轮跳过".format(
+                                ctx["ticket_type"], rn.component_code, rn.raw_name, rn.node.node_id
+                            )
+                        )
                     )
                     continue
 
@@ -638,13 +648,17 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
                     normalized_name=normalized_name,
                 )
                 if baseline is None:
-                    logger.info(
-                        "[NodeDuration] 没有命中到对应耗时基线统计" " tt=%s biz=%s code=%s name=%s node_id=%s",
-                        ctx["ticket_type"],
-                        ctx["bk_biz_id"],
-                        rn.component_code,
-                        normalized_name,
-                        rn.node.node_id,
+                    self.log_info(
+                        _(
+                            "[NodeDuration] 没有命中到对应耗时基线统计 "
+                            "tt={} biz={} code={} name={} node_id={}".format(
+                                ctx["ticket_type"],
+                                ctx["bk_biz_id"],
+                                rn.component_code,
+                                normalized_name,
+                                rn.node.node_id,
+                            )
+                        )
                     )
                     continue
 
@@ -661,14 +675,12 @@ class CheckNodeDurationForAIService(SidecarServiceABC):
                 processed += 1
             except Exception as err:
                 # 单节点异常不中断整轮
-                logger.warning(
-                    "[NodeDuration] 处理单节点异常 node_id=%s err=%s",
-                    getattr(rn.node, "node_id", "?"),
-                    err,
+                self.log_warning(
+                    _("[NodeDuration] 处理单节点异常 node_id={} err={}".format(getattr(rn.node, "node_id", "?"), err))
                 )
 
         if processed == 0:
-            logger.debug("[NodeDuration] 本轮未产生任何告警 root_id=%s", ctx["root_id"])
+            self.log_info(_("[NodeDuration] 本轮未产生任何告警 root_id={}".format(ctx["root_id"])))
 
         return True
 
