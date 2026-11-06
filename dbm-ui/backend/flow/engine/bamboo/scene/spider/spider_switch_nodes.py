@@ -69,7 +69,7 @@ class TenDBClusterSwitchNodesFlow(TenDBClusterAddNodesFlow, TenDBClusterReduceNo
     """
 
     # 定义临时解除单据互斥锁的单据类型列表
-    temporary_unlock_ticket_type_before_switch_list = [
+    pre_switch_unlock_types = [
         TicketType.TENDBCLUSTER_IMPORT_SQLFILE,
         TicketType.TENDBCLUSTER_FORCE_IMPORT_SQLFILE,
         TicketType.TENDBCLUSTER_SEMANTIC_CHECK,
@@ -77,10 +77,15 @@ class TenDBClusterSwitchNodesFlow(TenDBClusterAddNodesFlow, TenDBClusterReduceNo
     ]
 
     # 定义执行替换前临时开放的单据类型列表
-    temporary_unlock_ticket_type_before_run_list = [
+    pre_expand_unlock_types = [
         TicketType.TENDBCLUSTER_MIGRATE_CLUSTER,
         TicketType.TENDBCLUSTER_NODE_REBALANCE,
     ]
+
+    @property
+    def all_unlock_types(self) -> list:
+        """所有临时解锁的单据类型全集：人工确认时需全部重新互斥（与前面各解锁 act 的范围保持一致）"""
+        return self.pre_expand_unlock_types + self.pre_switch_unlock_types
 
     def __init__(self, root_id: str, data: Optional[Dict]):
         """
@@ -317,14 +322,14 @@ class TenDBClusterSwitchNodesFlow(TenDBClusterAddNodesFlow, TenDBClusterReduceNo
         # 执行spider扩容节点之前，允许remote替换类单据进入
         if not disable_manual_confirm:
             # 释放对单据的互斥锁
-            # 单据类型：TenDBCLuster的SQL变更/强制变更/模拟执行/授权
+            # 单据类型：TenDBCLuster的整机迁移/节点均衡（remote替换类单据）
             sub_pipeline.add_act(
-                act_name=_("释放部分单据互斥锁"),
+                act_name=_("释放remote替换类单据互斥锁"),
                 act_component_code=AddUnlockTicketTypeConfigComponent.code,
                 kwargs=asdict(
                     AddUnLockTicketTypeKwargs(
                         cluster_ids=[cluster_id],
-                        unlock_ticket_type_list=self.temporary_unlock_ticket_type_before_run_list,
+                        unlock_ticket_type_list=self.pre_expand_unlock_types,
                     )
                 ),
             )
@@ -347,12 +352,12 @@ class TenDBClusterSwitchNodesFlow(TenDBClusterAddNodesFlow, TenDBClusterReduceNo
             # 释放对单据的互斥锁
             # 单据类型：TenDBCLuster的SQL变更/强制变更/模拟执行/授权
             sub_pipeline.add_act(
-                act_name=_("释放部分单据互斥锁"),
+                act_name=_("释放变更类单据互斥锁"),
                 act_component_code=AddUnlockTicketTypeConfigComponent.code,
                 kwargs=asdict(
                     AddUnLockTicketTypeKwargs(
                         cluster_ids=[cluster_id],
-                        unlock_ticket_type_list=self.temporary_unlock_ticket_type_before_switch_list,
+                        unlock_ticket_type_list=self.pre_switch_unlock_types,
                     )
                 ),
             )
@@ -364,8 +369,7 @@ class TenDBClusterSwitchNodesFlow(TenDBClusterAddNodesFlow, TenDBClusterReduceNo
                 kwargs=asdict(
                     ReleaseUnLockTicketTypeKwargs(
                         cluster_ids=[cluster_id],
-                        release_unlock_ticket_type_list=self.temporary_unlock_ticket_type_before_run_list
-                        + self.temporary_unlock_ticket_type_before_switch_list,
+                        release_unlock_ticket_type_list=self.all_unlock_types,
                     )
                 ),
             )

@@ -1064,7 +1064,7 @@ def remote_migrate_switch_sub_flow(
     @param created_by: 提单者
     """
     # 获取cluster对应的中控primary
-    ctl_primary = cluster.tendbcluster_ctl_primary_address()
+    # ctl_primary = cluster.tendbcluster_ctl_primary_address()
 
     # 获取所有接入层正在running 状态的spider列表
     spiders = cluster.proxyinstance_set.filter(status=InstanceStatus.RUNNING)
@@ -1083,13 +1083,17 @@ def remote_migrate_switch_sub_flow(
 
     sub_pipeline = SubBuilder(root_id=root_id, data=parent_global_data)
 
+    # 由于获取集群的中控primary改成在flow运行期间获取
+    # 那么下发最新版本的db-actuator介质，由只下发中控primary所在机器，改成集群所有spider机器
+    # 这样做构造flow时候不需要知道primary是谁，同时避免flow运行期间中控集群发生切换
+    # 造成flow的不可逆的影响
     sub_pipeline.add_act(
         act_name=_("下发db-actuator介质"),
         act_component_code=TransFileComponent.code,
         kwargs=asdict(
             DownloadMediaKwargs(
                 bk_cloud_id=cluster.bk_cloud_id,
-                exec_ip=ctl_primary.split(":")[0],
+                exec_ip=[s.machine.ip for s in spiders],
                 file_list=GetFileList(db_type=DBType.MySQL).get_db_actuator_package(),
             )
         ),
