@@ -85,7 +85,10 @@ _IP_LIST_PATTERN: Pattern = re.compile(rf"{_IP_LIST_UNIT}(?:{_IP_LIST_SEP}{_IP_L
 #: 边界说明：使用显式字符集 [A-Za-z0-9_.-] 的负向断言，不用 \w
 #: 原因：Python3 默认 re.UNICODE 下中文属于 \w，"集群test..." 中"群"和"t"之间
 #: 不是 \b，\w 类边界会失效；显式字符集只匹配 ASCII 域名字符，中文自然不在其中
-_CLUSTER_DOMAIN_PATTERN: Pattern = re.compile(r"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9_-]+\.){2,}db(?![A-Za-z0-9_.-])")
+#: 右边界修正：右断言不再排除 '-'。历史版本曾把 '-' 排除在右断言外，导致
+#: "cache.xxx.yyy.db-更新版本" 这种 "域名-中文动作" 拼接形态失配（域名原样保留，
+#: 每个集群一个类别，Redis 侧 redis_update_version 等组件类别爆炸至 100+ 触发熔断）
+_CLUSTER_DOMAIN_PATTERN: Pattern = re.compile(r"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9_-]+\.){2,}db(?![A-Za-z0-9_.])")
 
 #: hex/hash 长串（≥16 位十六进制字符）；如 MD5 / commit hash
 #: 边界说明：使用 (?<![0-9a-fA-F]) / (?![0-9a-fA-F]) 而非 \b
@@ -115,36 +118,92 @@ _WINDOWS_PATH_PATTERN: Pattern = re.compile(r"(?:[A-Za-z]:\\|\\\\)[A-Za-z0-9_.\-
 #: ISO 时间戳（形如 2026-07-03 11:15:16 或 2026-07-03T11:15:16）
 _ISO_TIMESTAMP_PATTERN: Pattern = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
 
+#: 中文批次序号（形如 第1批、第12批）
+#: 场景：编排层按批次下发时拼进 name 的进度序号（生产样本：REDIS_CHANGE_BIZ "第1批-下发介质"）
+#: 设计说明：批次序号是"进度参数"，对节点耗时无影响 → 折叠；与 "等待N秒"（幅度参数，
+#:           直接决定节点耗时）严格区分，后者故意不做任何折叠
+_CN_BATCH_NO_PATTERN: Pattern = re.compile(r"第\d+批")
+
+#: N/M 计数器对（形如 批次1/697、批次105/679）
+#: 场景：Redis 系统巡检（ROLE/ENTRY/CONF_CHECK）历史编排按批次推进时拼进 name 的进度参数
+#:       （新编排已改为组件内部自等待，存量 flow_tree 样本仍含此类节点名）
+#: 设计说明：N（当前批次）与 M（总批次数）对节点耗时均无影响，且 M 随集群总数漂移
+#:           （679→680→...），因此折叠为单一占位符 <N/M>，避免类别随总数漂移缓慢泄漏
+#: 顺序要求：必须排在路径规则之后（真路径已替换为 <PATH>，避免 '/' 被误参与配对）
+_BATCH_PAIR_PATTERN: Pattern = re.compile(r"\d+/\d+")
+
+#: 长数字 ID（≥6 位连续数字；如 cluster_id:21046105、紧凑时间戳 20250101120000）
+#: 场景：生产样本 MONGODB_EXEC_SCRIPT_APPLY "MongoDB-cluster_id:21046105-<IP>:<PORT>-执行脚本"，
+#:       cluster_id 8 位数字无任何规则覆盖，导致每个 cluster 一个类别
+#: 设计说明：端口 2~5 位、IP 四段式已由前面规则处理，此处兜住 6 位以上裸数字串；
+#:           1~5 位裸数字（批次号、等待秒数等）故意不折叠，保留幅度语义
+#: 顺序要求：必须排在 UUID 之后（避免吃掉 UUID 的纯数字分段）、HEX 之前
+_NUMERIC_ID_PATTERN: Pattern = re.compile(r"(?<!\d)\d{6,}(?!\d)")
+
+#: 通用 ASCII 标识符（兜底规则）：同时含字母和数字的 token（顺序不限），或 ≥3 个连字符段的 token
+#: 覆盖形态（生产样本）：
+#:   - 集群名（含连字符）：lzjd-aqq01-game / moh-test3000 / lszz-newproduct-conf / codepanda-exp-rs（无数字、3 段）
+#:   - 点分+连字符混合（Redis DTS）：10001-qq.3218migrate / qq.3218
+#:   - 数字在前字母在后（Redis DTS）：10002-qq / 10002-qqmigrate
+#:   - 角色+编号：Proxy-004
+#: 设计说明（分层策略）：
+#:   - "身份/地址类" token 折叠（指哪台机器/哪个集群，不改变动作本身的耗时特征）；
+#:     "幅度类" token（等待N秒、端口数）保留
+#:   - 混合分支用两个 lookahead 断言 "含字母" 且 "含数字"，与出现顺序无关
+#:   - 纯字母单词（无数字、连字符段 < 3）不折叠，避免误伤语义词（Redis-、node-、exec 等前缀）
+#:   - 已知取舍：MySQL-8.0 类 "产品-版本" token 会被折叠；utf8/sha256 等含数字英文词也会折叠
+#:     —— 词表有限，最多产生几个固定类别；MySQL 重跑后若需保留版本语义，
+#:     再加 <VERSION> 规则前置保护即可
+#: 顺序要求：必须放最后——等前面规则把 IP/端口/域名/路径替换成占位符后再兜底，
+#:           否则会先吃掉域名与 IP 列表；占位符本身（<IP>/<PORT_LIST> 等）不含数字
+#:           且无 3 段连字符结构，不会被本规则二次匹配
+_ASCII_ID_PATTERN: Pattern = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(?:(?=[A-Za-z0-9_.-]*\d)(?=[A-Za-z0-9_.-]*[A-Za-z])[A-Za-z0-9_.-]+"
+    r"|[A-Za-z0-9_.]+(?:-[A-Za-z0-9_.]+){2,})"
+    r"(?![A-Za-z0-9_.-])"
+)
+
 #: 通用清洗规则表：(pattern, placeholder)；按顺序应用
-#: 顺序说明：
-#:   1. 先替换集群域名 → <DOMAIN>（域名结构最独特，先吃掉避免被 IP 规则拆错）
-#:   2. 再替换 IP → <IP>（避免后续规则误伤）
-#:   3. 再替换文件路径 → <PATH>（必须早于 HASH / PORT：路径里可能内嵌 hex 子目录与数字段）
-#:   4. 再替换端口（避免和 IP 里的数字混淆）
+#: 顺序说明（分层策略：结构化占位符 → 中文上下文计数器 → 独立 token → 通用兜底）：
+#:   1. 先替换集群域名 → <DOMAIN>（域名结构最独特，先吃掉避免被 IP 规则拆错/被兜底规则吃掉）
+#:   2. 替换中文批次序号 第N批 → 第<N>批（中文上下文，越早越不易被 ASCII 规则干扰）
+#:   3. 再替换 IP → <IP>（避免后续规则误伤）
+#:   4. 再替换文件路径 → <PATH>（必须早于 HASH / PORT / N-M 对：路径里可能内嵌 hex 子目录、数字段与 '/'）
+#:   5. 再替换 N/M 计数器对 → <N/M>（晚于路径；早于端口，避免与端口数字混淆）
+#:   6. 再替换端口（避免和 IP 里的数字混淆）
 #:      —— 端口列表 [P1, P2, ...] 必须早于单端口 [P]，否则列表里的单元素会被先吃
-#:   5. 再替换 UUID → <UUID>（必须早于 HASH：UUID 的 12 位段 < 16 位不会被 HASH 吃，但顺序更稳）
-#:   6. 再替换 hex / 时间戳这类独立 token
-#:   7. 清理 <IP> 外层引号，避免出现 '<IP>' 的多余引号形态
-#:   8. 最后折叠 <IP>/<IP>:<PORT> 列表为 <IP_LIST>
-#:      —— 必须放在最后：等前面把单值都替换成占位符后，再对占位符做长度归一
+#:   7. 再替换 UUID → <UUID>（必须早于 HASH / NUM：避免分段被吃）
+#:   8. 再替换长数字 ID → <NUM>（晚于 UUID；兜住 cluster_id / 紧凑时间戳）
+#:   9. 再替换 hex / 时间戳这类独立 token
+#:   10. 清理 <IP> 外层引号，避免出现 '<IP>' 的多余引号形态
+#:   11. 折叠 <IP>/<IP>:<PORT> 列表为 <IP_LIST>（等单值占位符生成后再做长度归一）
+#:   12. 最后通用 ASCII 标识符 → <NAME> 兜底（必须最末：占位符先生成，且避免先吃域名/IP 列表）
 NAME_CLEAN_RULES: List[Tuple[Pattern, str]] = [
     (_CLUSTER_DOMAIN_PATTERN, "<DOMAIN>"),
+    (_CN_BATCH_NO_PATTERN, "第<N>批"),
     (_IPV4_PATTERN, "<IP>"),
     (_WINDOWS_PATH_PATTERN, "<PATH>"),
     (_LINUX_PATH_PATTERN, "<PATH>"),
+    (_BATCH_PAIR_PATTERN, "<N/M>"),
     (_COLON_PORT_PATTERN, ":<PORT>"),
     (_BRACKET_PORT_LIST_PATTERN, "[<PORT_LIST>]"),
     (_BRACKET_PORT_PATTERN, "[<PORT>]"),
     (_UUID_PATTERN, "<UUID>"),
+    (_NUMERIC_ID_PATTERN, "<NUM>"),
     (_HEX_HASH_PATTERN, "<HASH>"),
     (_ISO_TIMESTAMP_PATTERN, "<TS>"),
     (_QUOTED_IP_PATTERN, "<IP>"),
     (_IP_LIST_PATTERN, "<IP_LIST>"),
+    (_ASCII_ID_PATTERN, "<NAME>"),
 ]
 
 #: name 清洗前的最大处理长度；超长部分先截断，避免 LLM prompt 膨胀
-#: 单位：字符；生产实测最长 name < 100 字符，200 是安全上限
-MAX_NAME_LENGTH_FOR_NORMALIZE: int = 200
+#: 单位：字符；历史值 200 会把 30+ 端口的列表（约 210+ 字符）拦腰截断，闭合 ']'
+#: 丢失导致端口列表规则失配（生产样本形如 "1.2.3.4-[30000, 30001, 30-写入元数据"，
+#: 每台机器一个唯一类别，redis_db_meta 组件类别爆炸）。清洗后的 name 实际很短，
+#: 截断只影响清洗前的正则匹配，1000 是安全上限
+MAX_NAME_LENGTH_FOR_NORMALIZE: int = 1000
 
 
 # =============================================================================
