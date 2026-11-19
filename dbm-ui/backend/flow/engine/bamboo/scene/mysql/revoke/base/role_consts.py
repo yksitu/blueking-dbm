@@ -25,6 +25,9 @@ Revoke 框架专用 role 字符串常量模块。
 #: 不复用 ``InstanceRole.REDIS_PROXY`` 以避免 Redis 语义误导。
 PROXY: str = "proxy"
 
-#: TenDBCluster 的 spider 接入层角色（含同机 tdbctl 中控）。
-#: InstanceRole 未定义该条目；由 role=SPIDER 的单个 unit 同时覆盖 spider_port 与 ctl_port。
+#: TenDBCluster 的 spider 接入层角色。
+#: spider 全系（master / 只读 slave / mnt）统一使用本角色；role 只驱动 host_check F2 路由
+#: （路径 3 DNS + CLB），spider 全系判据行为一致，无需再细分。
+#: expected_ports 统一仅含 spider 端口：db_meta 中 tdbctl 以同一 ProxyInstance 的 admin_port
+#: 落库（port=spider_port），不存在 port=ctl_port 的实例记录。
 SPIDER: str = "spider"
